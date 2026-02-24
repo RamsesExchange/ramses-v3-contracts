@@ -1,6 +1,6 @@
-# Ramses
+# Ramses V3
 
-Ramses is a metaDEX built on HyperEVM, powered by x(3,3) and deflationary mechanisms.
+Ramses is innovative, multichain, DEX infrastructure
 
 - **Website:** [https://www.ramses.xyz/](https://www.ramses.xyz/)
 - **Docs:** [https://docs.ramses.xyz](https://docs.ramses.xyz)
