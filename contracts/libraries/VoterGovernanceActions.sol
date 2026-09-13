@@ -25,17 +25,17 @@ import {IGaugeFactory} from "contracts/interfaces/IGaugeFactory.sol";
 import {IFeeRecipient} from "contracts/interfaces/IFeeRecipient.sol";
 import {IFeeDistributorFactory} from "contracts/interfaces/IFeeDistributorFactory.sol";
 import {IRamsesV3Pool} from "contracts/CL/core/interfaces/IRamsesV3Pool.sol";
+import {VoterDLMMActions} from "contracts/libraries/VoterDLMMActions.sol";
 
 /// @title VoterGovernanceActions
 /// @notice Governance logic for Voter
 /// @dev Used to reduce Voter contract size by moving all governance related logic to a library
 library VoterGovernanceActions {
-    event FeeDistributorUpdated(address indexed gauge, address oldFeeDistributor, address newFeeDistributor);   
+    event FeeDistributorUpdated(address indexed gauge, address oldFeeDistributor, address newFeeDistributor);
     using EnumerableSet for EnumerableSet.AddressSet;
 
     uint256 internal constant DURATION = 7 days;
     uint256 public constant BASIS = 1_000_000;
-    uint256 public constant OLD_LEGACY_FEE_SPLIT_BASIS = 10_000;
 
     function setGlobalRatio(uint256 _xRatio) external {
         VoterStorage.VoterState storage $ = VoterStorage.getStorage();
@@ -54,8 +54,6 @@ library VoterGovernanceActions {
             emit IVoter.NewGovernor(msg.sender, _governor);
         }
     }
-
-
 
     function whitelist(address _token) public {
         VoterStorage.VoterState storage $ = VoterStorage.getStorage();
@@ -81,6 +79,7 @@ library VoterGovernanceActions {
         /// @dev set the gauge to dead
         $.isAlive[_gauge] = false;
         address pool = $.poolForGauge[_gauge];
+        VoterDLMMActions.setKilledProtocolShare(_gauge);
 
         /// @dev fetch the last distribution
         uint256 _lastDistro = $.lastDistro[_gauge];
@@ -117,12 +116,13 @@ library VoterGovernanceActions {
 
         /// @dev ensure the gauge is dead and exists
         require(!$.isAlive[_gauge] && $.gauges.contains(_gauge), Errors.ACTIVE_GAUGE(_gauge));
-        
+
         /// @dev clear any stale redirection for this gauge
         $.gaugeRedirect[_gauge] = address(0);
-        
+
         /// @dev set the gauge to alive
         $.isAlive[_gauge] = true;
+        VoterDLMMActions.setRevivedProtocolShare(_gauge);
         /// @dev check if it's a legacy gauge
         if ($.isLegacyGauge[_gauge]) {
             address pool = $.poolForGauge[_gauge];
@@ -139,7 +139,7 @@ library VoterGovernanceActions {
             uint256[] memory feeSplits = new uint256[](1);
 
             pools[0] = pool;
-            feeSplits[0] = OLD_LEGACY_FEE_SPLIT_BASIS;
+            feeSplits[0] = BASIS;
 
             IAccessHub($.accessHub).setFeeSplitLegacy(pools, feeSplits);
         }
@@ -327,38 +327,65 @@ library VoterGovernanceActions {
         IFeeDistributor(_feeDistributor).removeReward(reward);
     }
 
+    function addAuthorizedClaimer(address _claimer) external {
+        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
+
+        require(_claimer != address(0), Errors.ZERO_ADDRESS());
+        require($.authorizedClaimers.add(_claimer), Errors.ALREADY_ADDED(_claimer));
+    }
+
+    function removeAuthorizedClaimer(address _claimer) external {
+        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
+
+        require($.authorizedClaimers.remove(_claimer), Errors.NOT_FOUND(_claimer));
+    }
+
+    function setTimeThresholdForRewarder(uint256 _timeThreshold) external {
+        VoterStorage.getStorage().timeThresholdForRewarder = _timeThreshold;
+    }
+
+    function setRewardValidator(address _rewardValidator) external {
+        VoterStorage.getStorage().rewardValidator = _rewardValidator;
+    }
+
+    function toggleAntiSybil() external {
+        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
+
+        $.isAntiSybilEnabled = !$.isAntiSybilEnabled;
+    }
+
     /// @notice Update FeeDistributor for a gauge (emergency governance function)
     function updateFeeDistributorForGauge(address _gauge, address _newFeeDistributor) external {
         VoterStorage.VoterState storage $ = VoterStorage.getStorage();
-        
-        require($.poolForGauge[_gauge] != address(0), "Invalid gauge");
-        require(_newFeeDistributor != address(0), "Zero address");
-        
+
+        require($.poolForGauge[_gauge] != address(0), Errors.NO_GAUGE(_gauge));
+        require(_newFeeDistributor != address(0), Errors.ZERO_ADDRESS());
+
         address oldFeeDistributor = $.feeDistributorForGauge[_gauge];
-        
+
         // Update mappings
         $.feeDistributorForGauge[_gauge] = _newFeeDistributor;
         $.poolForFeeDistributor[_newFeeDistributor] = $.poolForGauge[_gauge];
-        
+
         // Update the sets if needed
         if (oldFeeDistributor != address(0)) {
             $.feeDistributors.remove(oldFeeDistributor);
         }
         $.feeDistributors.add(_newFeeDistributor);
-        
+
         emit FeeDistributorUpdated(_gauge, oldFeeDistributor, _newFeeDistributor);
     }
 
     /// @notice Create a new FeeDistributor with specified feeRecipient (emergency governance function)
     function createFeeDistributorWithRecipient(address _feeRecipient) external returns (address) {
         VoterStorage.VoterState storage $ = VoterStorage.getStorage();
-        
+
         // Create the FeeDistributor (msg.sender will be the Voter contract)
         address _feeDistributor = IFeeDistributorFactory($.feeDistributorFactory).createFeeDistributor(_feeRecipient);
-        
+
         // Add to the feeDistributors set
         $.feeDistributors.add(_feeDistributor);
-        
+
         return _feeDistributor;
     }
 

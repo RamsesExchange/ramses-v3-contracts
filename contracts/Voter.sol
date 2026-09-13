@@ -8,30 +8,22 @@ import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {VoterRewardClaimers} from "./libraries/VoterRewardClaimers.sol";
 
-import {IAccessHub} from "./interfaces/IAccessHub.sol";
 import {IMinter} from "./interfaces/IMinter.sol";
-import {IPair} from "./interfaces/IPair.sol";
-import {IPairFactory} from "./interfaces/IPairFactory.sol";
-import {IFeeRecipient} from "./interfaces/IFeeRecipient.sol";
-import {IFeeRecipientFactory} from "./interfaces/IFeeRecipientFactory.sol";
 
 import {IRamsesV3Factory} from "./CL/core/interfaces/IRamsesV3Factory.sol";
-import {IRamsesV3Pool} from "./CL/core/interfaces/IRamsesV3Pool.sol";
-import {IClGaugeFactory} from "./CL/gauge/interfaces/IClGaugeFactory.sol";
-import {IFeeCollector} from "./CL/gauge/interfaces/IFeeCollector.sol";
-import {GaugeV3} from "./CL/gauge/GaugeV3.sol";
 
 import {IVoteModule} from "./interfaces/IVoteModule.sol";
 import {IVoter} from "./interfaces/IVoter.sol";
 import {Errors} from "contracts/libraries/Errors.sol";
 import {IFeeDistributor} from "./interfaces/IFeeDistributor.sol";
-import {IFeeDistributorFactory} from "./interfaces/IFeeDistributorFactory.sol";
 import {IGauge} from "./interfaces/IGauge.sol";
 import {IGaugeFactory} from "./interfaces/IGaugeFactory.sol";
 import {IXRam} from "./interfaces/IXRam.sol";
 
 import {VoterStorage} from "./libraries/VoterStorage.sol";
 import {VoterGovernanceActions} from "./libraries/VoterGovernanceActions.sol";
+import {VoterDLMMActions} from "./libraries/VoterDLMMActions.sol";
+import {VoterFeeSyncActions} from "./libraries/VoterFeeSyncActions.sol";
 
 contract Voter is IVoter, ReentrancyGuard, Initializable {
     using EnumerableSet for EnumerableSet.AddressSet;
@@ -54,12 +46,19 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
         _disableInitializers();
     }
 
-    /// @dev should be called with upgradeToAndInitialize
+    /// @notice Phase-one bootstrap for fee-only satellite deployments.
+    /// @dev Call atomically when deploying the proxy. This establishes AccessHub governance while leaving
+    ///      voting, gauges, emissions, and fee routing inactive. During phase one, AccessHub may use this
+    ///      Voter only as the DLMM factory registry; factory and fee-collector voter fields should remain zero.
     function initializeAccessHub(address _accessHub) external initializer {
         VoterStorage.getStorage().accessHub = _accessHub;
     }
 
-    /// @dev separated from initializeAccessHub to minimize changes to deployment scripts
+    /// @notice Phase-two activation for a full protocol deployment.
+    /// @dev Separated from initializeAccessHub so a fee-only satellite can later add the complete voting,
+    ///      gauge, and emissions system without replacing AccessHub or migrating Voter storage. All phase-two
+    ///      dependencies, especially RAM and xRAM, must be real contracts before AccessHub calls this function.
+    ///      A DLMM factory registered during phase one is intentionally preserved.
     function initialize(InitializationParams memory inputs) external reinitializer(2) {
         VoterStorage.VoterState storage $ = VoterStorage.getStorage();
 
@@ -78,7 +77,7 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
         $.clFactory = inputs.clFactory;
         $.clGaugeFactory = inputs.clGaugeFactory;
         $.nfpManager = inputs.nfpManager;
-        
+
         // initialize the authorizedClaimers set with the initial nfpManager + Voter
         if (inputs.nfpManager != address(0)) {
             $.authorizedClaimers.add(inputs.nfpManager);
@@ -166,10 +165,19 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
     }
 
     /// @inheritdoc IVoter
+    function dlmmFactory() external view returns (address) {
+        return VoterStorage.getStorage().dlmmFactory;
+    }
+
+    /// @inheritdoc IVoter
+    function dlmmRewarderFactory() external view returns (address) {
+        return VoterStorage.getStorage().dlmmRewarderFactory;
+    }
+
+    /// @inheritdoc IVoter
     function clGaugeFactory() external view returns (address) {
         return VoterStorage.getStorage().clGaugeFactory;
     }
-
 
     /// @inheritdoc IVoter
     function nfpManager() external view returns (address) {
@@ -196,7 +204,6 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
         return VoterStorage.getStorage().xRatio;
     }
 
- 
     function gaugeForPool(address pool) external view returns (address) {
         return VoterStorage.getStorage().gaugeForPool[pool];
     }
@@ -265,6 +272,10 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
         return VoterStorage.getStorage().isClGauge[gauge];
     }
 
+    function isDLMMRewarder(address rewarder) external view returns (bool) {
+        return VoterStorage.getStorage().isDLMMRewarder[rewarder];
+    }
+
     function isWhitelisted(address token) external view returns (bool) {
         return VoterStorage.getStorage().isWhitelisted[token];
     }
@@ -323,8 +334,7 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
                 /// @dev wipe the mapping
                 delete $.userVotesForPoolPerPeriod[user][nextPeriod][votedPools[i]];
                 /// @dev call _withdraw on the FeeDistributor
-                IFeeDistributor feeDist =
-                    IFeeDistributor($.feeDistributorForGauge[$.gaugeForPool[votedPools[i]]]);
+                IFeeDistributor feeDist = IFeeDistributor($.feeDistributorForGauge[$.gaugeForPool[votedPools[i]]]);
                 uint256 currentAmount = feeDist.userVotes(nextPeriod, user);
                 if (currentAmount > 0) {
                     IFeeDistributor(feeDist)._withdraw(currentAmount, user);
@@ -497,10 +507,16 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
 
             /// @dev fetch ram address
             address _xRam = address($.xRam);
-            /// @dev fetch the current ratio and multiply by the claimable
-            uint256 _xRamClaimable = (_claimable * $.xRatio) / BASIS;
-            /// @dev remove from the regular claimable tokens (RAM)
-            _claimable -= _xRamClaimable;
+            bool isDLMM = $.isDLMMRewarder[_gauge];
+            uint256 _xRamClaimable;
+
+            /// @dev DLMM receives RAM only; legacy/CL keep the global xRAM split.
+            if (!isDLMM) {
+                /// @dev fetch the current ratio and multiply by the claimable
+                _xRamClaimable = (_claimable * $.xRatio) / BASIS;
+                /// @dev remove from the regular claimable tokens (RAM)
+                _claimable -= _xRamClaimable;
+            }
 
             /// @dev can only distribute if the distributed amount / week > 0 and is > left()
             bool canDistribute = true;
@@ -509,7 +525,7 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
             if (_claimable > 0) {
                 if (
                     _claimable / DURATION == 0
-                        || (_claimable < IGauge(_gauge).left($.ram) && $.isLegacyGauge[_gauge])
+                        || (!isDLMM && _claimable < IGauge(_gauge).left($.ram) && $.isLegacyGauge[_gauge])
                 ) {
                     canDistribute = false;
                 }
@@ -518,7 +534,7 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
             if (_xRamClaimable > 0) {
                 if (
                     _xRamClaimable / DURATION == 0
-                        || (_xRamClaimable < IGauge(_gauge).left(_xRam) && $.isLegacyGauge[_gauge])
+                        || (!isDLMM && _xRamClaimable < IGauge(_gauge).left(_xRam) && $.isLegacyGauge[_gauge])
                 ) {
                     canDistribute = false;
                 }
@@ -529,22 +545,28 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
                 /// @dev set it to true firstly
                 $.gaugePeriodDistributed[_gauge][_period] = true;
 
-                /// @dev fetch destination gauge if there is an override
-                address destinationGauge = $.gaugeRedirect[_gauge];
-                if (destinationGauge == address(0)) {
-                    destinationGauge = _gauge;
-                }
+                if (isDLMM) {
+                    if (_claimable > 0) {
+                        VoterDLMMActions.notifyRewarder(_gauge, $.ram, _claimable);
+                    }
+                } else {
+                    /// @dev fetch destination gauge if there is an override
+                    address destinationGauge = $.gaugeRedirect[_gauge];
+                    if (destinationGauge == address(0)) {
+                        destinationGauge = _gauge;
+                    }
 
-                /// @dev check RAM "claimable"
-                if (_claimable > 0) {
-                    /// @dev notify emissions
-                    IGauge(destinationGauge).notifyRewardAmount($.ram, _claimable);
-                }
-                /// @dev check xRAM "claimable"
-                if (_xRamClaimable > 0) {
-                    /// @dev convert, then notify the xRam
-                    IXRam(_xRam).convertEmissionsToken(_xRamClaimable);
-                    IGauge(destinationGauge).notifyRewardAmount(_xRam, _xRamClaimable);
+                    /// @dev check RAM "claimable"
+                    if (_claimable > 0) {
+                        /// @dev notify emissions
+                        IGauge(destinationGauge).notifyRewardAmount($.ram, _claimable);
+                    }
+                    /// @dev check xRAM "claimable"
+                    if (_xRamClaimable > 0) {
+                        /// @dev convert, then notify the xRam
+                        IXRam(_xRam).convertEmissionsToken(_xRamClaimable);
+                        IGauge(destinationGauge).notifyRewardAmount(_xRam, _xRamClaimable);
+                    }
                 }
 
                 emit DistributeReward(msg.sender, _gauge, _claimable + _xRamClaimable);
@@ -601,7 +623,7 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
     /// @inheritdoc IVoter
     function setNfpManager(address _nfpManager) external onlyGovernance {
         VoterGovernanceActions.setNfpManager(_nfpManager);
-        
+
         // Also update the nfpManagers set for multiple nfpManagers support
         VoterStorage.VoterState storage $ = VoterStorage.getStorage();
         if (!$.authorizedClaimers.contains(_nfpManager)) {
@@ -612,44 +634,65 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
     /// @inheritdoc IVoter
     function getAllAuthorizedClaimers() external view returns (address[] memory) {
         VoterStorage.VoterState storage $ = VoterStorage.getStorage();
-        
+
         // If nfpManagers set is empty, return the legacy nfpManager
         if ($.authorizedClaimers.length() == 0 && $.nfpManager != address(0)) {
             address[] memory managers = new address[](1);
             managers[0] = $.nfpManager;
             return managers;
         }
-        
+
         return $.authorizedClaimers.values();
     }
 
     /// @notice Add a new authorized claimer to the whitelist
     /// @param _claimer The authorized claimer address to add
     function addAuthorizedClaimer(address _claimer) external onlyGovernance {
-        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
-        require(_claimer != address(0), "Zero address");
-        require($.authorizedClaimers.add(_claimer), "Already added");
+        VoterGovernanceActions.addAuthorizedClaimer(_claimer);
     }
 
     /// @notice Remove an authorized claimer from the whitelist
     /// @param _claimer The authorized claimer address to remove
     function removeAuthorizedClaimer(address _claimer) external onlyGovernance {
-        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
-        require($.authorizedClaimers.remove(_claimer), "Not found");
+        VoterGovernanceActions.removeAuthorizedClaimer(_claimer);
+    }
+
+    /// @inheritdoc IVoter
+    function isAuthorizedDLMMManager(address manager) external view returns (bool) {
+        return VoterStorage.getStorage().isAuthorizedDLMMManager[manager];
+    }
+
+    /// @inheritdoc IVoter
+    function addAuthorizedDLMMManager(address manager) external onlyGovernance {
+        VoterDLMMActions.addAuthorizedDLMMManager(manager);
+    }
+
+    /// @inheritdoc IVoter
+    function removeAuthorizedDLMMManager(address manager) external onlyGovernance {
+        VoterDLMMActions.removeAuthorizedDLMMManager(manager);
     }
 
     /// @notice Set the minimum time threshold for rewarder (in seconds)
     function setTimeThresholdForRewarder(uint256 _timeThreshold) external onlyGovernance {
-        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
-        $.timeThresholdForRewarder = _timeThreshold;    
+        VoterGovernanceActions.setTimeThresholdForRewarder(_timeThreshold);
     }
 
     /// @inheritdoc IVoter
     function setRewardValidator(address _rewardValidator) external onlyGovernance {
-        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
-        $.rewardValidator = _rewardValidator;
+        VoterGovernanceActions.setRewardValidator(_rewardValidator);
     }
-    
+
+    /// @inheritdoc IVoter
+    function setDLMMFactory(address _dlmmFactory) external onlyGovernance {
+        // Available after phase-one bootstrap; it does not activate gauges or change collector/factory voter fields.
+        VoterDLMMActions.setDLMMFactory(_dlmmFactory);
+    }
+
+    /// @inheritdoc IVoter
+    function setDLMMRewarderFactory(address _dlmmRewarderFactory) external onlyGovernance {
+        VoterDLMMActions.setDLMMRewarderFactory(_dlmmRewarderFactory);
+    }
+
     ////////////////////
     // Gauge Creation //
     ////////////////////
@@ -669,6 +712,16 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
     }
 
     /// @inheritdoc IVoter
+    function createDLMMRewarder(address pool) external onlyGovernance returns (address) {
+        return VoterDLMMActions.createDLMMRewarder(pool);
+    }
+
+    /// @inheritdoc IVoter
+    function setDLMMRewarderDeltaBins(address rewarder, int24 deltaBinA, int24 deltaBinB) external onlyGovernance {
+        VoterDLMMActions.setDLMMRewarderDeltaBins(rewarder, deltaBinA, deltaBinB);
+    }
+
+    /// @inheritdoc IVoter
     function redirectEmissions(address tokenA, address tokenB, address destinationGauge) public onlyGovernance {
         VoterGovernanceActions.redirectEmissions(tokenA, tokenB, destinationGauge);
     }
@@ -682,7 +735,6 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
     function updateFeeDistributorForGauge(address _gauge, address _newFeeDistributor) external onlyGovernance {
         VoterGovernanceActions.updateFeeDistributorForGauge(_gauge, _newFeeDistributor);
     }
-
 
     /////////////////////////////
     // One-stop Reward Claimer //
@@ -727,7 +779,6 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
         VoterRewardClaimers.claimRewards(_gauges, _tokens);
     }
 
-
     //////////////////////////
     // Emission Calculation //
     //////////////////////////
@@ -756,7 +807,7 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
         VoterStorage.VoterState storage $ = VoterStorage.getStorage();
 
         /// @dev update the period if not already done
-        IMinter($.minter).updatePeriod();
+        IMinter($.minter).updatePeriodAndRebase();
         /// @dev fetch the last distribution
         uint256 _lastDistro = $.lastDistro[_gauge];
         /// @dev fetch the current period
@@ -772,46 +823,7 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
         }
         /// @dev if the last distribution wasn't the current period
         if (_lastDistro != currentPeriod) {
-            /// @dev check if a CL gauge
-            if ($.isClGauge[_gauge]) {
-                if ($.voterOwnsFactory) {
-                    if ($.isAlive[_gauge]) {
-                        /// @dev set the feeProtocol to 100% (all fees to voters while emissions active)
-                        IRamsesV3Factory($.clFactory).gaugeFeeSplitEnable(pool);
-                    } else {
-                        /// @dev gauge is dead, set fee protocol to 95/5 (95% to LPs, 5% to protocol)
-                        /// @dev call AccessHub to set the fee protocol since only it has permission
-                        address[] memory pools = new address[](1);
-                        pools[0] = pool;
-                        uint24[] memory feeProtocols = new uint24[](1);
-                        feeProtocols[0] = 50_000; // 5% of 1_000_000 denominator
-                        IAccessHub($.accessHub).setFeeSplitCL(pools, feeProtocols);
-                    }
-                }
-                address poolV3 = pool;
-                /// @dev collect fees by calling from the FeeCollector
-                IFeeCollector(IRamsesV3Factory($.clFactory).feeCollector()).collectProtocolFees(poolV3);
-            }
-            /// @dev if it's a legacy gauge, fees are handled as LP tokens and thus need to be treated diff
-            else if ($.isLegacyGauge[_gauge]) {
-                /// @dev review for fresh deployment
-                address[] memory pools = new address[](1);
-                uint256[] memory feeSplits = new uint256[](1);
-                pools[0] = pool;
-
-                if ($.isAlive[_gauge]) {
-                    /// @dev set the feeSplit to be 100% going to the feeDistributor
-                    feeSplits[0] = BASIS; // 100%
-                } else {
-                    feeSplits[0] = BASIS / 20; // 5%
-                }
-                IAccessHub($.accessHub).setFeeSplitLegacy(pools, feeSplits);
-
-                /// @dev mint the fees
-                IPair(pool).mintFee();
-                /// @dev notify the fees to the FeeDistributor
-                IFeeRecipient(IFeeRecipientFactory($.feeRecipientFactory).feeRecipientForPair(pool)).notifyFees();
-            }
+            VoterFeeSyncActions.syncFeeSplitAndCollectFees(_gauge, pool, BASIS);
         }
         /// @dev set the last distribution for the gauge as the currentPeriod
         $.lastDistro[_gauge] = currentPeriod;
@@ -840,11 +852,7 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
         uint256 gaugesLength = $.gauges.length();
         /// @dev loop through and call distribute for every index
         for (uint256 i; i < gaugesLength; ++i) {
-            address gauge = $.gauges.at(i);
-            /// @dev use try/catch to prevent one gauge from blocking the entire distribution
-            try this.distribute(gauge) {} catch {
-                emit DistributionFailed(gauge, $.poolForGauge[gauge]);
-            }
+            distribute($.gauges.at(i));
         }
     }
 
@@ -860,11 +868,9 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
         }
         /// @dev loop through and distribute
         for (uint256 i = startIndex; i < endIndex; ++i) {
-            address gauge = $.gauges.at(i);
-            /// @dev use try/catch to prevent one gauge from blocking the entire distribution
-            try this.distribute(gauge) {} catch {
-                emit DistributionFailed(gauge, $.poolForGauge[gauge]);
-            }
+            bytes memory data = abi.encodeCall(this.distribute, ($.gauges.at(i)));
+            (bool _success,) = address(this).call(data);
+            _success;
         }
     }
 
@@ -979,7 +985,7 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
         token0 = tokenA < tokenB ? tokenA : tokenB;
         token1 = token0 == tokenA ? tokenB : tokenA;
     }
-    
+
     /// @dev anti-sybil on rewarder section
     /// @inheritdoc IVoter
     function isAntiSybilEnabled() external view returns (bool) {
@@ -998,7 +1004,6 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
 
     /// @inheritdoc IVoter
     function toggleAntiSybil() external onlyGovernance {
-        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
-        $.isAntiSybilEnabled = !$.isAntiSybilEnabled;
+        VoterGovernanceActions.toggleAntiSybil();
     }
 }

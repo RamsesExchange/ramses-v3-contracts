@@ -39,8 +39,6 @@ contract FeeRecipientFactory is IFeeRecipientFactory {
         accessHub = _accessHub;
         treasury = _accessHub.treasury();
         voter = address(_accessHub.voter());
-        /// @dev start at 5%
-        feeToTreasury = 50_000;
     }
 
     /// @inheritdoc IFeeRecipientFactory

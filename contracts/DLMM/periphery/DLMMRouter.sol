@@ -1,0 +1,949 @@
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.20;
+
+import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+
+import {BinHelper} from "../libraries/BinHelper.sol";
+import {Constants} from "../libraries/Constants.sol";
+import {Encoded} from "../libraries/math/Encoded.sol";
+import {FeeHelper} from "../libraries/FeeHelper.sol";
+import {LiquidityConfigurations} from "../libraries/math/LiquidityConfigurations.sol";
+import {PackedUint128Math} from "../libraries/math/PackedUint128Math.sol";
+import {Uint256x256Math} from "../libraries/math/Uint256x256Math.sol";
+
+import {IDLMMPool} from "../interfaces/IDLMMPool.sol";
+import {IDLMMToken} from "../interfaces/IDLMMToken.sol";
+import {IDLMMRouter} from "../interfaces/IDLMMRouter.sol";
+import {IDLMMFactory} from "../interfaces/IDLMMFactory.sol";
+import {IWNATIVE} from "../interfaces/IWNATIVE.sol";
+
+/// @title Liquidity Bin Router
+/// @notice Main contract to interact with to swap and manage liquidity.
+contract DLMMRouter is IDLMMRouter {
+    using SafeERC20 for IERC20;
+    using PackedUint128Math for bytes32;
+
+    IDLMMFactory private immutable _factory;
+    IWNATIVE private immutable _wnative;
+
+    modifier onlyFactoryOwner() {
+        if (msg.sender != Ownable(address(_factory)).owner()) revert LBRouter__NotFactoryOwner();
+        _;
+    }
+
+    modifier ensure(uint256 deadline) {
+        if (block.timestamp > deadline) revert LBRouter__DeadlineExceeded(deadline, block.timestamp);
+        _;
+    }
+
+    modifier verifyPathValidity(Path memory path) {
+        if (
+            path.pairBinSteps.length == 0 || path.versions.length != path.pairBinSteps.length
+                || path.pairBinSteps.length + 1 != path.tokenPath.length
+        ) revert LBRouter__LengthsMismatch();
+        _;
+    }
+
+    /// @notice Constructor
+    /// @param factory Address of the DLMM factory
+    /// @param wnative Address of WNATIVE
+    constructor(IDLMMFactory factory, IWNATIVE wnative) {
+        _factory = factory;
+        _wnative = wnative;
+    }
+
+    /// @dev Receive function that only accept NATIVE from the WNATIVE contract
+    receive() external payable {
+        if (msg.sender != address(_wnative)) revert LBRouter__SenderIsNotWNATIVE();
+    }
+
+    /// View function to get the factory address
+    /// @return lbFactory The address of the factory
+    function getFactory() external view override returns (IDLMMFactory lbFactory) {
+        return _factory;
+    }
+
+    /// View function to get the WNATIVE address
+    /// @return wnative The address of WNATIVE
+    function getWNATIVE() external view override returns (IWNATIVE wnative) {
+        return _wnative;
+    }
+
+    /// @notice Returns the approximate id corresponding to the inputted price.
+    /// Warning, the returned id may be inaccurate close to the start price of a bin
+    /// @param pair The address of the DLMM pool
+    /// @param price The price of y per x (multiplied by 1e36)
+    /// @return The id corresponding to this price
+    function getIdFromPrice(IDLMMPool pair, uint256 price) external view override returns (uint24) {
+        return pair.getIdFromPrice(price);
+    }
+
+    /// @notice Returns the price corresponding to the inputted id
+    /// @param pair The address of the DLMM pool
+    /// @param id The id
+    /// @return The price corresponding to this id
+    function getPriceFromId(IDLMMPool pair, uint24 id) external view override returns (uint256) {
+        return pair.getPriceFromId(id);
+    }
+
+    /// @notice Simulate a swap in
+    /// @param pair The address of the DLMM pool
+    /// @param amountOut The amount of token to receive
+    /// @param swapForY Whether you swap X for Y (true), or Y for X (false)
+    /// @return amountIn The amount of token to send in order to receive amountOut token
+    /// @return amountOutLeft The amount of token Out that can't be returned due to a lack of liquidity
+    /// @return fee The amount of fees paid in token sent
+    function getSwapIn(IDLMMPool pair, uint128 amountOut, bool swapForY)
+        public
+        view
+        override
+        returns (uint128 amountIn, uint128 amountOutLeft, uint128 fee)
+    {
+        (amountIn, amountOutLeft, fee) = pair.getSwapIn(amountOut, swapForY);
+    }
+
+    /// @notice Simulate a swap out
+    /// @param pair The address of the DLMM pool
+    /// @param amountIn The amount of token sent
+    /// @param swapForY Whether you swap X for Y (true), or Y for X (false)
+    /// @return amountInLeft The amount of token In that can't be swapped due to a lack of liquidity
+    /// @return amountOut The amount of token received if amountIn tokenX are sent
+    /// @return fee The amount of fees paid in token sent
+    function getSwapOut(IDLMMPool pair, uint128 amountIn, bool swapForY)
+        external
+        view
+        override
+        returns (uint128 amountInLeft, uint128 amountOut, uint128 fee)
+    {
+        (amountInLeft, amountOut, fee) = pair.getSwapOut(amountIn, swapForY);
+    }
+
+    /// @notice Create a DLMM pool for tokenX and tokenY using the factory
+    /// @param tokenX The address of the first token
+    /// @param tokenY The address of the second token
+    /// @param activeId The active id of the pair
+    /// @param binStep The bin step in basis point, used to calculate log(1 + binStep)
+    /// @return pair The address of the newly created DLMM pool
+    function createLBPair(IERC20 tokenX, IERC20 tokenY, uint24 activeId, uint16 binStep)
+        external
+        override
+        returns (IDLMMPool pair)
+    {
+        pair = _factory.createLBPair(tokenX, tokenY, activeId, binStep);
+    }
+
+    /// @notice Add liquidity while performing safety checks
+    /// @dev This function is compliant with fee on transfer tokens
+    /// @param liquidityParameters The liquidity parameters
+    /// @return amountXAdded The amount of token X added
+    /// @return amountYAdded The amount of token Y added
+    /// @return amountXLeft The amount of token X left (sent back to liquidityParameters.refundTo)
+    /// @return amountYLeft The amount of token Y left (sent back to liquidityParameters.refundTo)
+    /// @return depositIds The ids of the deposits
+    /// @return liquidityMinted The amount of liquidity minted
+    function addLiquidity(LiquidityParameters calldata liquidityParameters)
+        external
+        override
+        returns (
+            uint256 amountXAdded,
+            uint256 amountYAdded,
+            uint256 amountXLeft,
+            uint256 amountYLeft,
+            uint256[] memory depositIds,
+            uint256[] memory liquidityMinted
+        )
+    {
+        _checkLiquidityRecipient(liquidityParameters.to);
+
+        IDLMMPool lbPair = IDLMMPool(
+            _getLBPairInformation(
+                liquidityParameters.tokenX, liquidityParameters.tokenY, liquidityParameters.binStep, Version.V2_1
+            )
+        );
+        if (liquidityParameters.tokenX != lbPair.getTokenX()) revert LBRouter__WrongTokenOrder();
+
+        _safeTransferFrom(liquidityParameters.tokenX, msg.sender, address(lbPair), liquidityParameters.amountX);
+        _safeTransferFrom(liquidityParameters.tokenY, msg.sender, address(lbPair), liquidityParameters.amountY);
+
+        (amountXAdded, amountYAdded, amountXLeft, amountYLeft, depositIds, liquidityMinted) =
+            _addLiquidity(liquidityParameters, lbPair);
+    }
+
+    /// @notice Add liquidity with NATIVE while performing safety checks
+    /// @dev This function is compliant with fee on transfer tokens
+    /// @param liquidityParameters The liquidity parameters
+    /// @return amountXAdded The amount of token X added
+    /// @return amountYAdded The amount of token Y added
+    /// @return amountXLeft The amount of token X left (sent back to liquidityParameters.refundTo)
+    /// @return amountYLeft The amount of token Y left (sent back to liquidityParameters.refundTo)
+    /// @return depositIds The ids of the deposits
+    /// @return liquidityMinted The amount of liquidity minted
+    function addLiquidityNATIVE(LiquidityParameters calldata liquidityParameters)
+        external
+        payable
+        override
+        returns (
+            uint256 amountXAdded,
+            uint256 amountYAdded,
+            uint256 amountXLeft,
+            uint256 amountYLeft,
+            uint256[] memory depositIds,
+            uint256[] memory liquidityMinted
+        )
+    {
+        _checkLiquidityRecipient(liquidityParameters.to);
+
+        IDLMMPool _LBPair = IDLMMPool(
+            _getLBPairInformation(
+                liquidityParameters.tokenX, liquidityParameters.tokenY, liquidityParameters.binStep, Version.V2_1
+            )
+        );
+        if (liquidityParameters.tokenX != _LBPair.getTokenX()) revert LBRouter__WrongTokenOrder();
+
+        if (liquidityParameters.tokenX == _wnative && liquidityParameters.amountX == msg.value) {
+            _safeTransferFrom(liquidityParameters.tokenY, msg.sender, address(_LBPair), liquidityParameters.amountY);
+            _wNativeDepositAndTransfer(address(_LBPair), msg.value);
+        } else if (liquidityParameters.tokenY == _wnative && liquidityParameters.amountY == msg.value) {
+            _safeTransferFrom(liquidityParameters.tokenX, msg.sender, address(_LBPair), liquidityParameters.amountX);
+            _wNativeDepositAndTransfer(address(_LBPair), msg.value);
+        } else {
+            revert LBRouter__WrongNativeLiquidityParameters(
+                address(liquidityParameters.tokenX),
+                address(liquidityParameters.tokenY),
+                liquidityParameters.amountX,
+                liquidityParameters.amountY,
+                msg.value
+            );
+        }
+
+        (amountXAdded, amountYAdded, amountXLeft, amountYLeft, depositIds, liquidityMinted) =
+            _addLiquidity(liquidityParameters, _LBPair);
+    }
+
+    /// @notice Remove liquidity while performing safety checks
+    /// @dev This function is compliant with fee on transfer tokens
+    /// @param tokenX The address of token X
+    /// @param tokenY The address of token Y
+    /// @param binStep The bin step of the DLMM pool
+    /// @param amountXMin The min amount to receive of token X
+    /// @param amountYMin The min amount to receive of token Y
+    /// @param ids The list of ids to burn
+    /// @param amounts The list of amounts to burn of each id in `_ids`
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountX Amount of token X returned
+    /// @return amountY Amount of token Y returned
+    function removeLiquidity(
+        IERC20 tokenX,
+        IERC20 tokenY,
+        uint16 binStep,
+        uint256 amountXMin,
+        uint256 amountYMin,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        address to,
+        uint256 deadline
+    ) external override ensure(deadline) returns (uint256 amountX, uint256 amountY) {
+        IDLMMPool _LBPair = IDLMMPool(_getLBPairInformation(tokenX, tokenY, binStep, Version.V2_1));
+        bool isWrongOrder = tokenX != _LBPair.getTokenX();
+
+        if (isWrongOrder) (amountXMin, amountYMin) = (amountYMin, amountXMin);
+
+        (amountX, amountY) = _removeLiquidity(_LBPair, amountXMin, amountYMin, ids, amounts, to);
+
+        if (isWrongOrder) (amountX, amountY) = (amountY, amountX);
+    }
+
+    /// @notice Remove NATIVE liquidity while performing safety checks
+    /// @dev This function is **NOT** compliant with fee on transfer tokens.
+    /// This is wanted as it would make users pays the fee on transfer twice,
+    /// use the `removeLiquidity` function to remove liquidity with fee on transfer tokens.
+    /// @param token The address of token
+    /// @param binStep The bin step of the DLMM pool
+    /// @param amountTokenMin The min amount to receive of token
+    /// @param amountNATIVEMin The min amount to receive of NATIVE
+    /// @param ids The list of ids to burn
+    /// @param amounts The list of amounts to burn of each id in `_ids`
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountToken Amount of token returned
+    /// @return amountNATIVE Amount of NATIVE returned
+    function removeLiquidityNATIVE(
+        IERC20 token,
+        uint16 binStep,
+        uint256 amountTokenMin,
+        uint256 amountNATIVEMin,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        address payable to,
+        uint256 deadline
+    ) external override ensure(deadline) returns (uint256 amountToken, uint256 amountNATIVE) {
+        IDLMMPool lbPair = IDLMMPool(_getLBPairInformation(token, IERC20(_wnative), binStep, Version.V2_1));
+
+        {
+            bool isNATIVETokenY = IERC20(_wnative) == lbPair.getTokenY();
+
+            if (!isNATIVETokenY) {
+                (amountTokenMin, amountNATIVEMin) = (amountNATIVEMin, amountTokenMin);
+            }
+
+            (uint256 amountX, uint256 amountY) =
+                _removeLiquidity(lbPair, amountTokenMin, amountNATIVEMin, ids, amounts, address(this));
+
+            (amountToken, amountNATIVE) = isNATIVETokenY ? (amountX, amountY) : (amountY, amountX);
+        }
+
+        _safeTransfer(token, to, amountToken);
+        _wNativeWithdrawAndTransfer(to, amountNATIVE);
+    }
+
+    /// @notice Swaps exact tokens for tokens while performing safety checks
+    /// @param amountIn The amount of token to send
+    /// @param amountOutMin The min amount of token to receive
+    /// @param path The path of the swap
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountOut Output amount of the swap
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        Path memory path,
+        address to,
+        uint256 deadline
+    ) external override ensure(deadline) verifyPathValidity(path) returns (uint256 amountOut) {
+        address[] memory pairs = _getPairs(path.pairBinSteps, path.versions, path.tokenPath);
+
+        _safeTransferFrom(path.tokenPath[0], msg.sender, pairs[0], amountIn);
+
+        amountOut = _swapExactTokensForTokens(amountIn, pairs, path.versions, path.tokenPath, to);
+
+        if (amountOutMin > amountOut) revert LBRouter__InsufficientAmountOut(amountOutMin, amountOut);
+    }
+
+    /// @notice Swaps exact tokens for NATIVE while performing safety checks
+    /// @param amountIn The amount of token to send
+    /// @param amountOutMinNATIVE The min amount of NATIVE to receive
+    /// @param path The path of the swap
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountOut Output amount of the swap
+    function swapExactTokensForNATIVE(
+        uint256 amountIn,
+        uint256 amountOutMinNATIVE,
+        Path memory path,
+        address payable to,
+        uint256 deadline
+    ) external override ensure(deadline) verifyPathValidity(path) returns (uint256 amountOut) {
+        if (path.tokenPath[path.pairBinSteps.length] != IERC20(_wnative)) {
+            revert LBRouter__InvalidTokenPath(address(path.tokenPath[path.pairBinSteps.length]));
+        }
+
+        address[] memory pairs = _getPairs(path.pairBinSteps, path.versions, path.tokenPath);
+
+        _safeTransferFrom(path.tokenPath[0], msg.sender, pairs[0], amountIn);
+
+        amountOut = _swapExactTokensForTokens(amountIn, pairs, path.versions, path.tokenPath, address(this));
+
+        if (amountOutMinNATIVE > amountOut) revert LBRouter__InsufficientAmountOut(amountOutMinNATIVE, amountOut);
+
+        _wNativeWithdrawAndTransfer(to, amountOut);
+    }
+
+    /// @notice Swaps exact NATIVE for tokens while performing safety checks
+    /// @param amountOutMin The min amount of token to receive
+    /// @param path The path of the swap
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountOut Output amount of the swap
+    function swapExactNATIVEForTokens(uint256 amountOutMin, Path memory path, address to, uint256 deadline)
+        external
+        payable
+        override
+        ensure(deadline)
+        verifyPathValidity(path)
+        returns (uint256 amountOut)
+    {
+        if (path.tokenPath[0] != IERC20(_wnative)) {
+            revert LBRouter__InvalidTokenPath(address(path.tokenPath[0]));
+        }
+
+        address[] memory pairs = _getPairs(path.pairBinSteps, path.versions, path.tokenPath);
+
+        _wNativeDepositAndTransfer(pairs[0], msg.value);
+
+        amountOut = _swapExactTokensForTokens(msg.value, pairs, path.versions, path.tokenPath, to);
+
+        if (amountOutMin > amountOut) revert LBRouter__InsufficientAmountOut(amountOutMin, amountOut);
+    }
+
+    /// @notice Swaps tokens for exact tokens while performing safety checks
+    /// @param amountOut The amount of token to receive
+    /// @param amountInMax The max amount of token to send
+    /// @param path The path of the swap
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountsIn Input amounts of the swap
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        Path memory path,
+        address to,
+        uint256 deadline
+    ) external override ensure(deadline) verifyPathValidity(path) returns (uint256[] memory amountsIn) {
+        address[] memory pairs = _getPairs(path.pairBinSteps, path.versions, path.tokenPath);
+
+        {
+            amountsIn = _getAmountsIn(path.versions, pairs, path.tokenPath, amountOut);
+
+            if (amountsIn[0] > amountInMax) revert LBRouter__MaxAmountInExceeded(amountInMax, amountsIn[0]);
+
+            _safeTransferFrom(path.tokenPath[0], msg.sender, pairs[0], amountsIn[0]);
+
+            uint256 _amountOutReal = _swapTokensForExactTokens(pairs, path.versions, path.tokenPath, amountsIn, to);
+
+            if (_amountOutReal < amountOut) revert LBRouter__InsufficientAmountOut(amountOut, _amountOutReal);
+        }
+    }
+
+    /// @notice Swaps tokens for exact NATIVE while performing safety checks
+    /// @param amountNATIVEOut The amount of NATIVE to receive
+    /// @param amountInMax The max amount of token to send
+    /// @param path The path of the swap
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountsIn path amounts for every step of the swap
+    function swapTokensForExactNATIVE(
+        uint256 amountNATIVEOut,
+        uint256 amountInMax,
+        Path memory path,
+        address payable to,
+        uint256 deadline
+    ) external override ensure(deadline) verifyPathValidity(path) returns (uint256[] memory amountsIn) {
+        if (path.tokenPath[path.pairBinSteps.length] != IERC20(_wnative)) {
+            revert LBRouter__InvalidTokenPath(address(path.tokenPath[path.pairBinSteps.length]));
+        }
+
+        address[] memory pairs = _getPairs(path.pairBinSteps, path.versions, path.tokenPath);
+        amountsIn = _getAmountsIn(path.versions, pairs, path.tokenPath, amountNATIVEOut);
+
+        if (amountsIn[0] > amountInMax) revert LBRouter__MaxAmountInExceeded(amountInMax, amountsIn[0]);
+
+        _safeTransferFrom(path.tokenPath[0], msg.sender, pairs[0], amountsIn[0]);
+
+        uint256 _amountOutReal =
+            _swapTokensForExactTokens(pairs, path.versions, path.tokenPath, amountsIn, address(this));
+
+        if (_amountOutReal < amountNATIVEOut) revert LBRouter__InsufficientAmountOut(amountNATIVEOut, _amountOutReal);
+
+        _wNativeWithdrawAndTransfer(to, _amountOutReal);
+    }
+
+    /// @notice Swaps NATIVE for exact tokens while performing safety checks
+    /// @dev Will refund any NATIVE amount sent in excess to `msg.sender`
+    /// @param amountOut The amount of tokens to receive
+    /// @param path The path of the swap
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountsIn path amounts for every step of the swap
+    function swapNATIVEForExactTokens(uint256 amountOut, Path memory path, address to, uint256 deadline)
+        external
+        payable
+        override
+        ensure(deadline)
+        verifyPathValidity(path)
+        returns (uint256[] memory amountsIn)
+    {
+        if (path.tokenPath[0] != IERC20(_wnative)) {
+            revert LBRouter__InvalidTokenPath(address(path.tokenPath[0]));
+        }
+
+        address[] memory pairs = _getPairs(path.pairBinSteps, path.versions, path.tokenPath);
+        amountsIn = _getAmountsIn(path.versions, pairs, path.tokenPath, amountOut);
+
+        if (amountsIn[0] > msg.value) revert LBRouter__MaxAmountInExceeded(msg.value, amountsIn[0]);
+
+        _wNativeDepositAndTransfer(pairs[0], amountsIn[0]);
+
+        uint256 amountOutReal = _swapTokensForExactTokens(pairs, path.versions, path.tokenPath, amountsIn, to);
+
+        if (amountOutReal < amountOut) revert LBRouter__InsufficientAmountOut(amountOut, amountOutReal);
+
+        if (msg.value > amountsIn[0]) _safeTransferNative(msg.sender, msg.value - amountsIn[0]);
+    }
+
+    /// @notice Swaps exact tokens for tokens while performing safety checks supporting for fee on transfer tokens
+    /// @param amountIn The amount of token to send
+    /// @param amountOutMin The min amount of token to receive
+    /// @param path The path of the swap
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountOut Output amount of the swap
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        Path memory path,
+        address to,
+        uint256 deadline
+    ) external override ensure(deadline) verifyPathValidity(path) returns (uint256 amountOut) {
+        address[] memory pairs = _getPairs(path.pairBinSteps, path.versions, path.tokenPath);
+
+        IERC20 targetToken = path.tokenPath[pairs.length];
+
+        uint256 balanceBefore = targetToken.balanceOf(to);
+
+        _safeTransferFrom(path.tokenPath[0], msg.sender, pairs[0], amountIn);
+
+        _swapSupportingFeeOnTransferTokens(pairs, path.versions, path.tokenPath, to);
+
+        amountOut = targetToken.balanceOf(to) - balanceBefore;
+        if (amountOutMin > amountOut) revert LBRouter__InsufficientAmountOut(amountOutMin, amountOut);
+    }
+
+    /// @notice Swaps exact tokens for NATIVE while performing safety checks supporting for fee on transfer tokens
+    /// @param amountIn The amount of token to send
+    /// @param amountOutMinNATIVE The min amount of NATIVE to receive
+    /// @param path The path of the swap
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountOut Output amount of the swap
+    function swapExactTokensForNATIVESupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMinNATIVE,
+        Path memory path,
+        address payable to,
+        uint256 deadline
+    ) external override ensure(deadline) verifyPathValidity(path) returns (uint256 amountOut) {
+        if (path.tokenPath[path.pairBinSteps.length] != IERC20(_wnative)) {
+            revert LBRouter__InvalidTokenPath(address(path.tokenPath[path.pairBinSteps.length]));
+        }
+
+        address[] memory pairs = _getPairs(path.pairBinSteps, path.versions, path.tokenPath);
+
+        uint256 balanceBefore = _wnative.balanceOf(address(this));
+
+        _safeTransferFrom(path.tokenPath[0], msg.sender, pairs[0], amountIn);
+
+        _swapSupportingFeeOnTransferTokens(pairs, path.versions, path.tokenPath, address(this));
+
+        amountOut = _wnative.balanceOf(address(this)) - balanceBefore;
+        if (amountOutMinNATIVE > amountOut) revert LBRouter__InsufficientAmountOut(amountOutMinNATIVE, amountOut);
+
+        _wNativeWithdrawAndTransfer(to, amountOut);
+    }
+
+    /// @notice Swaps exact NATIVE for tokens while performing safety checks supporting for fee on transfer tokens
+    /// @param amountOutMin The min amount of token to receive
+    /// @param path The path of the swap
+    /// @param to The address of the recipient
+    /// @param deadline The deadline of the tx
+    /// @return amountOut Output amount of the swap
+    function swapExactNATIVEForTokensSupportingFeeOnTransferTokens(
+        uint256 amountOutMin,
+        Path memory path,
+        address to,
+        uint256 deadline
+    ) external payable override ensure(deadline) verifyPathValidity(path) returns (uint256 amountOut) {
+        if (path.tokenPath[0] != IERC20(_wnative)) revert LBRouter__InvalidTokenPath(address(path.tokenPath[0]));
+
+        address[] memory pairs = _getPairs(path.pairBinSteps, path.versions, path.tokenPath);
+
+        IERC20 targetToken = path.tokenPath[pairs.length];
+
+        uint256 balanceBefore = targetToken.balanceOf(to);
+
+        _wNativeDepositAndTransfer(pairs[0], msg.value);
+
+        _swapSupportingFeeOnTransferTokens(pairs, path.versions, path.tokenPath, to);
+
+        amountOut = targetToken.balanceOf(to) - balanceBefore;
+        if (amountOutMin > amountOut) revert LBRouter__InsufficientAmountOut(amountOutMin, amountOut);
+    }
+
+    /// @notice Unstuck tokens that are sent to this contract by mistake
+    /// @dev Only callable by the factory owner
+    /// @param token The address of the token
+    /// @param to The address of the user to send back the tokens
+    /// @param amount The amount to send
+    function sweep(IERC20 token, address to, uint256 amount) external override onlyFactoryOwner {
+        if (address(token) == address(0)) {
+            amount = amount == type(uint256).max ? address(this).balance : amount;
+
+            _safeTransferNative(to, amount);
+        } else {
+            amount = amount == type(uint256).max ? token.balanceOf(address(this)) : amount;
+
+            token.safeTransfer(to, amount);
+        }
+    }
+
+    /// @notice Unstuck DLMM tokens that are sent to this contract by mistake
+    /// @dev Only callable by the factory owner
+    /// @param lbToken The address of the DLMM token
+    /// @param to The address of the user to send back the tokens
+    /// @param ids The list of token ids
+    /// @param amounts The list of amounts to send
+    function sweepLBToken(IDLMMToken lbToken, address to, uint256[] calldata ids, uint256[] calldata amounts)
+        external
+        override
+        onlyFactoryOwner
+    {
+        lbToken.batchTransferFrom(address(this), to, ids, amounts);
+    }
+
+    /// @notice Helper function to add liquidity
+    /// @param liq The liquidity parameter
+    /// @param pair DLMM pool where liquidity is deposited
+    /// @return amountXAdded Amount of token X added
+    /// @return amountYAdded Amount of token Y added
+    /// @return amountXLeft Amount of token X left
+    /// @return amountYLeft Amount of token Y left
+    /// @return depositIds The list of deposit ids
+    /// @return liquidityMinted The list of liquidity minted
+    function _addLiquidity(LiquidityParameters calldata liq, IDLMMPool pair)
+        private
+        ensure(liq.deadline)
+        returns (
+            uint256 amountXAdded,
+            uint256 amountYAdded,
+            uint256 amountXLeft,
+            uint256 amountYLeft,
+            uint256[] memory depositIds,
+            uint256[] memory liquidityMinted
+        )
+    {
+        unchecked {
+            if (liq.deltaIds.length != liq.distributionX.length || liq.deltaIds.length != liq.distributionY.length) {
+                revert LBRouter__LengthsMismatch();
+            }
+
+            if (liq.activeIdDesired > type(uint24).max || liq.idSlippage > type(uint24).max) {
+                revert LBRouter__IdDesiredOverflows(liq.activeIdDesired, liq.idSlippage);
+            }
+
+            bytes32[] memory liquidityConfigs = new bytes32[](liq.deltaIds.length);
+            depositIds = new uint256[](liq.deltaIds.length);
+            {
+                uint256 _activeId = pair.getActiveId();
+                if (
+                    liq.activeIdDesired + liq.idSlippage < _activeId || _activeId + liq.idSlippage < liq.activeIdDesired
+                ) {
+                    revert LBRouter__IdSlippageCaught(liq.activeIdDesired, liq.idSlippage, _activeId);
+                }
+
+                for (uint256 i; i < liquidityConfigs.length; ++i) {
+                    int256 _id = int256(_activeId) + liq.deltaIds[i];
+
+                    if (_id < 0 || uint256(_id) > type(uint24).max) revert LBRouter__IdOverflows(_id);
+                    depositIds[i] = uint256(_id);
+                    liquidityConfigs[i] = LiquidityConfigurations.encodeParams(
+                        uint64(liq.distributionX[i]), uint64(liq.distributionY[i]), uint24(uint256(_id))
+                    );
+                }
+            }
+
+            bytes32 amountsReceived;
+            bytes32 amountsLeft;
+            (amountsReceived, amountsLeft, liquidityMinted) = pair.mint(liq.to, liquidityConfigs, liq.refundTo);
+
+            bytes32 amountsAdded = amountsReceived.sub(amountsLeft);
+
+            amountXAdded = amountsAdded.decodeX();
+            amountYAdded = amountsAdded.decodeY();
+
+            if (amountXAdded < liq.amountXMin || amountYAdded < liq.amountYMin) {
+                revert LBRouter__AmountSlippageCaught(liq.amountXMin, amountXAdded, liq.amountYMin, amountYAdded);
+            }
+
+            amountXLeft = amountsLeft.decodeX();
+            amountYLeft = amountsLeft.decodeY();
+        }
+    }
+
+    function _checkLiquidityRecipient(address to) private view {
+        if (to != msg.sender) revert LBRouter__UnauthorizedLiquidityRecipient(msg.sender, to);
+    }
+
+    /// @notice Helper function to return the amounts in
+    /// @param versions The list of versions; only V2_1 is supported
+    /// @param pairs The list of pairs
+    /// @param tokenPath The swap path
+    /// @param amountOut The amount out
+    /// @return amountsIn The list of amounts in
+    function _getAmountsIn(
+        Version[] memory versions,
+        address[] memory pairs,
+        IERC20[] memory tokenPath,
+        uint256 amountOut
+    ) private view returns (uint256[] memory amountsIn) {
+        amountsIn = new uint256[](tokenPath.length);
+        // Avoid doing -1, as `pairs.length == pairBinSteps.length-1`
+        amountsIn[pairs.length] = amountOut;
+
+        for (uint256 i = pairs.length; i != 0; i--) {
+            IERC20 token = tokenPath[i - 1];
+            Version version = versions[i - 1];
+            address pair = pairs[i - 1];
+
+            _checkDLMMVersion(version);
+            (amountsIn[i - 1],,) =
+                getSwapIn(IDLMMPool(pair), uint128(amountsIn[i]), IDLMMPool(pair).getTokenX() == token);
+        }
+    }
+
+    /// @notice Helper function to remove liquidity
+    /// @param pair The address of the DLMM pool
+    /// @param amountXMin The min amount to receive of token X
+    /// @param amountYMin The min amount to receive of token Y
+    /// @param ids The list of ids to burn
+    /// @param amounts The list of amounts to burn of each id in `_ids`
+    /// @param to The address of the recipient
+    /// @return amountX The amount of token X sent by the pair
+    /// @return amountY The amount of token Y sent by the pair
+    function _removeLiquidity(
+        IDLMMPool pair,
+        uint256 amountXMin,
+        uint256 amountYMin,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        address to
+    ) private returns (uint256 amountX, uint256 amountY) {
+        (bytes32[] memory amountsBurned) = pair.burn(msg.sender, to, ids, amounts);
+
+        for (uint256 i; i < amountsBurned.length; ++i) {
+            amountX += amountsBurned[i].decodeX();
+            amountY += amountsBurned[i].decodeY();
+        }
+
+        if (amountX < amountXMin || amountY < amountYMin) {
+            revert LBRouter__AmountSlippageCaught(amountXMin, amountX, amountYMin, amountY);
+        }
+    }
+
+    /// @notice Helper function to swap exact tokens for tokens
+    /// @param amountIn The amount of token sent
+    /// @param pairs The list of pairs
+    /// @param versions The list of versions; only V2_1 is supported
+    /// @param tokenPath The swap path using the binSteps following `pairBinSteps`
+    /// @param to The address of the recipient
+    /// @return amountOut The amount of token sent to `to`
+    function _swapExactTokensForTokens(
+        uint256 amountIn,
+        address[] memory pairs,
+        Version[] memory versions,
+        IERC20[] memory tokenPath,
+        address to
+    ) private returns (uint256 amountOut) {
+        Version version;
+        address recipient;
+        address pair;
+
+        IERC20 tokenNext = tokenPath[0];
+        amountOut = amountIn;
+
+        unchecked {
+            for (uint256 i; i < pairs.length; ++i) {
+                pair = pairs[i];
+                version = versions[i];
+
+                tokenNext = tokenPath[i + 1];
+
+                recipient = i + 1 == pairs.length ? to : pairs[i + 1];
+
+                _checkDLMMVersion(version);
+                bool swapForY = tokenNext == IDLMMPool(pair).getTokenY();
+
+                (uint256 amountXOut, uint256 amountYOut) = IDLMMPool(pair).swap(swapForY, recipient).decode();
+
+                if (swapForY) amountOut = amountYOut;
+                else amountOut = amountXOut;
+            }
+        }
+    }
+
+    /// @notice Helper function to swap tokens for exact tokens
+    /// @param pairs The array of pairs
+    /// @param versions The list of versions; only V2_1 is supported
+    /// @param tokenPath The swap path using the binSteps following `pairBinSteps`
+    /// @param to The address of the recipient
+    /// @return amountOut The amount of token sent to `to`
+    function _swapTokensForExactTokens(
+        address[] memory pairs,
+        Version[] memory versions,
+        IERC20[] memory tokenPath,
+        uint256[] memory,
+        address to
+    ) private returns (uint256 amountOut) {
+        address recipient;
+        address pair;
+        Version version;
+
+        IERC20 tokenNext = tokenPath[0];
+
+        unchecked {
+            for (uint256 i; i < pairs.length; ++i) {
+                pair = pairs[i];
+                version = versions[i];
+
+                tokenNext = tokenPath[i + 1];
+
+                recipient = i + 1 == pairs.length ? to : pairs[i + 1];
+
+                _checkDLMMVersion(version);
+                bool swapForY = tokenNext == IDLMMPool(pair).getTokenY();
+
+                (uint256 amountXOut, uint256 amountYOut) = IDLMMPool(pair).swap(swapForY, recipient).decode();
+
+                if (swapForY) amountOut = amountYOut;
+                else amountOut = amountXOut;
+            }
+        }
+    }
+
+    /// @notice Helper function to swap exact tokens supporting for fee on transfer tokens
+    /// @param pairs The list of pairs
+    /// @param versions The list of versions; only V2_1 is supported
+    /// @param tokenPath The swap path using the binSteps following `pairBinSteps`
+    /// @param to The address of the recipient
+    function _swapSupportingFeeOnTransferTokens(
+        address[] memory pairs,
+        Version[] memory versions,
+        IERC20[] memory tokenPath,
+        address to
+    ) private {
+        Version version;
+        address recipient;
+        address pair;
+
+        IERC20 tokenNext = tokenPath[0];
+
+        unchecked {
+            for (uint256 i; i < pairs.length; ++i) {
+                pair = pairs[i];
+                version = versions[i];
+
+                tokenNext = tokenPath[i + 1];
+
+                recipient = i + 1 == pairs.length ? to : pairs[i + 1];
+
+                _checkDLMMVersion(version);
+                IDLMMPool(pair).swap(tokenNext == IDLMMPool(pair).getTokenY(), recipient);
+            }
+        }
+    }
+
+    /// @notice Helper function to return the address of the DLMM pool
+    /// @dev Revert if the pair is not created yet
+    /// @param tokenX The address of the tokenX
+    /// @param tokenY The address of the tokenY
+    /// @param binStep The bin step of the DLMM pool
+    /// @param version The version of the DLMM pool
+    /// @return lbPair The address of the DLMM pool
+    function _getLBPairInformation(IERC20 tokenX, IERC20 tokenY, uint256 binStep, Version version)
+        private
+        view
+        returns (address lbPair)
+    {
+        _checkDLMMVersion(version);
+        lbPair = address(_factory.getLBPairInformation(tokenX, tokenY, binStep).LBPair);
+
+        if (lbPair == address(0)) {
+            revert LBRouter__PairNotCreated(address(tokenX), address(tokenY), binStep);
+        }
+    }
+
+    /// @notice Helper function to return the address of the DLMM pool
+    /// @dev Revert if the pair is not created yet
+    /// @param tokenX The address of the tokenX
+    /// @param tokenY The address of the tokenY
+    /// @param binStep The bin step of the DLMM pool
+    /// @param version The version of the DLMM pool
+    /// @return pair The address of the pair of binStep `binStep`
+    function _getPair(IERC20 tokenX, IERC20 tokenY, uint256 binStep, Version version)
+        private
+        view
+        returns (address pair)
+    {
+        pair = address(_getLBPairInformation(tokenX, tokenY, binStep, version));
+    }
+
+    function _checkDLMMVersion(Version version) private pure {
+        if (version != Version.V2_1) revert LBRouter__InvalidVersion(uint256(version));
+    }
+
+    /// @notice Helper function to return a list of pairs
+    /// @param pairBinSteps The list of bin steps
+    /// @param versions The list of versions (V1, V2 or V2_1)
+    /// @param tokenPath The swap path using the binSteps following `pairBinSteps`
+    /// @return pairs The list of pairs
+    function _getPairs(uint256[] memory pairBinSteps, Version[] memory versions, IERC20[] memory tokenPath)
+        private
+        view
+        returns (address[] memory pairs)
+    {
+        pairs = new address[](pairBinSteps.length);
+
+        IERC20 token;
+        IERC20 tokenNext = tokenPath[0];
+        unchecked {
+            for (uint256 i; i < pairs.length; ++i) {
+                token = tokenNext;
+                tokenNext = tokenPath[i + 1];
+
+                pairs[i] = _getPair(token, tokenNext, pairBinSteps[i], versions[i]);
+            }
+        }
+    }
+
+    /// @notice Helper function to transfer tokens to `to`
+    /// @param token The address of the token
+    /// @param to The address of the recipient
+    /// @param amount The amount to send
+    function _safeTransfer(IERC20 token, address to, uint256 amount) private {
+        if (amount == 0) return;
+
+        token.safeTransfer(to, amount);
+    }
+
+    /// @notice Helper function to transfer tokens from `from` to `to`
+    /// @param token The address of the token
+    /// @param from The address of the sender
+    /// @param to The address of the recipient
+    /// @param amount The amount to send
+    function _safeTransferFrom(IERC20 token, address from, address to, uint256 amount) private {
+        if (amount == 0) return;
+
+        token.safeTransferFrom(from, to, amount);
+    }
+
+    /// @notice Helper function to transfer NATIVE to `to`
+    /// @param to The address of the recipient
+    /// @param amount The amount to send
+    function _safeTransferNative(address to, uint256 amount) private {
+        if (amount == 0) return;
+
+        (bool success,) = to.call{value: amount}("");
+        if (!success) revert LBRouter__FailedToSendNATIVE(to, amount);
+    }
+
+    /// @notice Helper function to deposit and transfer WNative to `to`
+    /// @param to The address of the recipient
+    /// @param amount The amount to deposit and transfer
+    function _wNativeDepositAndTransfer(address to, uint256 amount) private {
+        if (amount == 0) return;
+
+        _wnative.deposit{value: amount}();
+        IERC20(_wnative).safeTransfer(to, amount);
+    }
+
+    /// @notice Helper function to withdraw and transfer WNative to `to`
+    /// @param to The address of the recipient
+    /// @param amount The amount to withdraw and transfer
+    function _wNativeWithdrawAndTransfer(address to, uint256 amount) private {
+        if (amount == 0) return;
+
+        _wnative.withdraw(amount);
+        _safeTransferNative(to, amount);
+    }
+}

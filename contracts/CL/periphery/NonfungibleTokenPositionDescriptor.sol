@@ -18,7 +18,7 @@ import './libraries/TokenRatioSortOrder.sol';
 contract NonfungibleTokenPositionDescriptor is INonfungibleTokenPositionDescriptor {
     address public immutable WETH9;
     /// @dev A null-terminated string
-    string public constant HYPE = 'HYPE';
+    string public constant NATIVE_CURRENCY_LABEL = 'ETH';
 
     constructor(address _WETH9) {
         WETH9 = _WETH9;
@@ -26,7 +26,7 @@ contract NonfungibleTokenPositionDescriptor is INonfungibleTokenPositionDescript
 
     /// @notice Returns the native currency label as a string
     function nativeCurrencyLabel() public pure returns (string memory) {
-        return HYPE;
+        return NATIVE_CURRENCY_LABEL;
     }
 
     /// @inheritdoc INonfungibleTokenPositionDescriptor

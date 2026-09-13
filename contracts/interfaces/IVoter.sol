@@ -35,6 +35,13 @@ interface IVoter {
 
     event DistributionFailed(address indexed gauge, address indexed pool);
 
+    event DLMMFactoryChanged(address indexed oldFactory, address indexed newFactory);
+    event DLMMRewarderFactoryChanged(address indexed oldFactory, address indexed newFactory);
+
+    event DLMMRewarderSet(address indexed rewarder, bool enabled);
+    event AuthorizedDLMMManagerAdded(address indexed manager);
+    event AuthorizedDLMMManagerRemoved(address indexed manager);
+
     struct InitializationParams {
         address ram;
         address legacyFactory;
@@ -50,6 +57,7 @@ interface IVoter {
         address voteModule;
     }
 
+    /// @notice Completes phase-two initialization and activates the dependencies required by the full protocol
     function initialize(InitializationParams memory inputs) external;
 
     /// @notice denominator basis
@@ -71,6 +79,12 @@ interface IVoter {
     /// @param _rewardValidator The address of the RewardValidator contract
     function setRewardValidator(address _rewardValidator) external;
 
+    /// @notice set the DLMM factory
+    function setDLMMFactory(address _dlmmFactory) external;
+
+    /// @notice set the DLMM rewarder factory
+    function setDLMMRewarderFactory(address _dlmmRewarderFactory) external;
+
     /// @notice xRam contract address
     function xRam() external view returns (address);
 
@@ -79,6 +93,12 @@ interface IVoter {
 
     /// @notice concentrated liquidity factory
     function clFactory() external view returns (address);
+
+    /// @notice DLMM factory address
+    function dlmmFactory() external view returns (address);
+
+    /// @notice DLMM rewarder factory address
+    function dlmmRewarderFactory() external view returns (address);
 
     /// @notice gauge factory for CL
     function clGaugeFactory() external view returns (address);
@@ -227,6 +247,14 @@ interface IVoter {
     /// @return _clGauge address of the new gauge
     function createCLGauge(address tokenA, address tokenB, int24 tickSpacing) external returns (address _clGauge);
 
+    /// @notice create a DLMM rewarder for an existing pool
+    /// @param pool the DLMM pool address
+    /// @return _dlmmRewarder address of the rewarder target
+    function createDLMMRewarder(address pool) external returns (address _dlmmRewarder);
+
+    /// @notice sets the rewarded bin range for a registered DLMM rewarder
+    function setDLMMRewarderDeltaBins(address rewarder, int24 deltaBinA, int24 deltaBinB) external;
+
     /// @notice claim concentrated liquidity gauge rewards for specific NFP token ids
     /// @param _gauges array of gauges
     /// @param _tokens two dimensional array for the tokens to claim
@@ -253,8 +281,7 @@ interface IVoter {
     /// @param owner address of the owner
     /// @param _feeDistributors address of the feeDists
     /// @param _tokens two dimensional array for the tokens to claim
-    function claimIncentives(address owner, address[] calldata _feeDistributors, address[][] calldata _tokens)
-        external;
+    function claimIncentives(address owner, address[] calldata _feeDistributors, address[][] calldata _tokens) external;
 
     /// @notice claim arbitrary rewards from specific feeDists and break up legacy pairs
     /// @param owner address of the owner
@@ -374,6 +401,10 @@ interface IVoter {
     /// @param gauge the gauge to check
     function isLegacyGauge(address gauge) external view returns (bool);
 
+    /// @notice returns if the address is a DLMM rewarder target
+    /// @param rewarder the rewarder to check
+    function isDLMMRewarder(address rewarder) external view returns (bool);
+
     /// @notice sets a new NFP manager
     function setNfpManager(address _nfpManager) external;
 
@@ -397,13 +428,22 @@ interface IVoter {
 
     /// @notice returns if the anti-sybil is enabled
     function isAntiSybilEnabled() external view returns (bool);
-    
+
     /// @notice returns all authorized claimers for CL gauges
     function getAllAuthorizedClaimers() external view returns (address[] memory);
-    
+
     /// @notice Add a new authorized claimer to the whitelist
     function addAuthorizedClaimer(address _claimer) external;
-    
+
     /// @notice Remove an authorized claimer from the whitelist
     function removeAuthorizedClaimer(address _claimer) external;
+
+    /// @notice returns if an address can route DLMM liquidity mints for rewarded pools
+    function isAuthorizedDLMMManager(address manager) external view returns (bool);
+
+    /// @notice Add a DLMM liquidity manager to the whitelist
+    function addAuthorizedDLMMManager(address manager) external;
+
+    /// @notice Remove a DLMM liquidity manager from the whitelist
+    function removeAuthorizedDLMMManager(address manager) external;
 }

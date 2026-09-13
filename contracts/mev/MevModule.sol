@@ -5,12 +5,15 @@ import {IXRam} from "contracts/interfaces/IXRam.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {IAccessHub} from "contracts/interfaces/IAccessHub.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ISwapRouter} from "contracts/CL/periphery/interfaces/ISwapRouter.sol";
 import {IFeeDistributor} from "contracts/interfaces/IFeeDistributor.sol";
 import {IRamsesV3Pool} from "contracts/CL/core/interfaces/IRamsesV3Pool.sol";
+import {IWETH} from "contracts/interfaces/IWETH.sol";
 import {IPairFactory} from "contracts/interfaces/IPairFactory.sol";
+import {IPair} from "contracts/interfaces/IPair.sol";
 import {IRouter} from "contracts/interfaces/IRouter.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
@@ -50,10 +53,12 @@ contract MevModule is Initializable {
     using EnumerableSet for EnumerableSet.AddressSet;
 
     /// constants
-    address public constant RAM = 0xEfD81eeC32B9A8222D1842ec3d99c7532C31e348;
-    address public constant XRAM = 0xc93B315971A4f260875103F5DA84cB1E30f366Cc;
-    address public constant X33 = 0xe4eEB461Ad1e4ef8b8EF71a33694CCD84Af051C4;
-    address public constant WETH = 0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f;
+    address public constant RAM = 0x555570a286F15EbDFE42B66eDE2f724Aa1AB5555;
+    address public constant XRAM = 0xAE6D5FcE541216BDA471D311425B5412D9f1DEb9;
+    address public constant X33 = 0x5555c2542836e7a6c8D3E133D5AA9773b65D5555;
+    address public constant WETH = 0x5555555555555555555555555555555555555555;
+    address public constant RAMSES_MULTISIG = 0x20D630cF1f5628285BfB91DfaC8C89eB9087BE1A;
+    uint256 public constant INVENTORY_FLOOR = 500 * 1e18;
 
     /// storage
     EnumerableSet.AddressSet private _authorizedExecutors;
@@ -61,12 +66,14 @@ contract MevModule is Initializable {
     ISwapRouter public swapRouter;
     IPairFactory public pairFactory;
     IRouter public legacyRouter;
+    uint256 public totalBuybackAndBurned;
+
     
 
     /// types
     struct AuthorizedSwapParams {
         address[] poolAddresses;
-        uint24[] originalFees;
+        uint24[] originalFees; // deprecated: kept for backward compatibility
         uint24[] targetFees;
         bool[] concentrated;
     }
@@ -91,6 +98,8 @@ contract MevModule is Initializable {
     error Unauthorized();
     error Unprofitable(uint256 initialBalance, uint256 finalBalance);
     error NotImplemented();
+    /// events
+    event BuybackAndBurn(uint256 amountIn, uint256 amountOut);
     /// constructors
     constructor() {
         _disableInitializers();
@@ -98,12 +107,12 @@ contract MevModule is Initializable {
 
     /// initializers
     function initialize() external initializer {
-        _authorizedExecutors.add(0x676F11a28E5F8A3ebF6Ae1187f05C30b0A95a8b0);
-        swapRouter = ISwapRouter(0x8BE024b5c546B5d45CbB23163e1a4dca8fA5052A);  
-        accessHub = IAccessHub(0x683035188E3670fda1deF2a7Aa5742DEa28Ed5f3);
+        _authorizedExecutors.add(0xAAA5D87392652647225B96563e469768f000b9De);
+        swapRouter = ISwapRouter(0x76D91074B46fF76E04FE59a90526a40009943fd2);
+        accessHub = IAccessHub(	0x6631a487d59893831b331653225E0bfeBf6Ea1EC);
         IERC20(RAM).approve(address(swapRouter), type(uint256).max);
-        pairFactory = IPairFactory(0xC0b920f6f1d6122B8187c031554dc8194F644592);
-        legacyRouter = IRouter(0x32dB39c56C171b4c96e974dDeDe8E42498929c54);
+        pairFactory = IPairFactory(0xd0a07E160511c40ccD5340e94660E9C9c01b0D27);
+        legacyRouter = IRouter(0xdcC44285fBc236457A5cd91C2f77AD8421B0D8ED);
     }
 
     /// modifiers
@@ -139,9 +148,22 @@ contract MevModule is Initializable {
     modifier authorizedSwap(
         AuthorizedSwapParams calldata _authParams
     ) {
+        // capture original fair fees
+        uint24[] memory originalFees = new uint24[](_authParams.poolAddresses.length);
+        for (uint256 i = 0; i < _authParams.poolAddresses.length; i++) {
+            if (_authParams.concentrated[i]) {
+                // V3 uint24
+                originalFees[i] = IRamsesV3Pool(_authParams.poolAddresses[i]).fee();
+            } else {
+                // legacy uint256
+                originalFees[i] = uint24(IPair(_authParams.poolAddresses[i]).fee());
+            }
+        }
+
+        // execute
         accessHub.setSwapFees(_authParams.poolAddresses, _authParams.targetFees);
         _;
-        accessHub.setSwapFees(_authParams.poolAddresses, _authParams.originalFees);
+        accessHub.setSwapFees(_authParams.poolAddresses, originalFees);
     }
 
     /*━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -171,28 +193,6 @@ contract MevModule is Initializable {
         IERC20(XRAM).approve(X33, type(uint256).max);
     }
 
-    /**
-     * @notice Executes AMO arbitrage when x33 redeem floor is surpassed
-     * @dev 
-     * Methodology:
-     *      ┌────────────────────────────────────────────┐
-     *      │ 1. Locate target liquidity pool            │
-     *      │ 2. Use authorizedSwap for optimal price    │
-     *      │ 3. Purchase x33 tokens using RAM        │
-     *      │ 4. Redeem x33 tokens for xRAM           │
-     *      │ 5. Perform instant exit: xRAM → RAM  │
-     *      │ 6. Bribe arbitrage earnings to voters      │
-     *      └────────────────────────────────────────────┘
-     * 
-     * Benefits: 
-     *      ┌───────────────────────────────────────────────────────┐
-     *      │ ▶ 50% of instant exit → voters as rebase              │
-     *      │ ▶ 100% of arbitrage proceeds → voters as bribes       │
-     *      │ ▶ all market inefficiencies captured by protocol      │
-     *      └───────────────────────────────────────────────────────┘
-     * 
-     * @dev Only callable by authorized MEV executors
-     */
     function amo(
         ISwapRouter.ExactInputSingleParams calldata _swapParams,
         AuthorizedSwapParams calldata _authParams,
@@ -257,30 +257,6 @@ contract MevModule is Initializable {
     }
 
 
-    /**
-     * @notice Executes atomic cyclical n-pool backrun arbitrage opportunities
-     * @dev 
-     * Methodology:
-     *      ┌────────────────────────────────────────────────────────────────┐
-     *      │ 1. Identifies profitable cyclical arbitrage paths              │
-     *      │    (e.g., wS → TokenA → TokenB → TokenC → wS)                  │
-     *      │ 2. Uses authorizedSwap for optimal price execution             │
-     *      │ 3. Executes complete arbitrage loop atomically                 │
-     *      │ 4. Profit is accumulated in this contract as wS until bribed   │
-     *      └────────────────────────────────────────────────────────────────┘
-     * 
-     * Benefits: 
-     *      ┌─────────────────────────────────────────────────────────────────┐
-     *      │ ▶ 100% of arbitrage profits distributed to voters as bribes     │
-     *      │ ▶ Protects protocol from value extraction by external MEV bots  │
-     *      │ ▶ Recaptures value that would otherwise leave the ecosystem     │
-     *      │ ▶ Implements a fair, protocol-owned MEV model with equitable    │
-     *      │   distribution to stakeholders                                  │
-     *      └─────────────────────────────────────────────────────────────────┘
-     * 
-     * 
-     * @dev Only callable by authorized MEV executors
-     */
     function backrun(
         PayloadType _payloadType,
         SwapIntent[] calldata _swapIntents,
@@ -350,7 +326,7 @@ contract MevModule is Initializable {
             if (balanceAfter <= balanceBefore) {
                 revert Unprofitable(balanceBefore, balanceAfter);
             }
-   
+
         }
         // 1 = EXECUTOR PAYLOAD
         if (_payloadType == PayloadType.EXECUTOR) {
@@ -414,6 +390,8 @@ contract MevModule is Initializable {
 
 
 
+
+
     function sanitizeApprovals(address[] calldata _tokens) external onlyAuthorizedExecutor {
         for (uint256 i = 0; i < _tokens.length; i++) {
             if (IERC20(_tokens[i]).allowance(address(this), address(legacyRouter)) < type(uint256).max / 2) {
@@ -425,12 +403,36 @@ contract MevModule is Initializable {
         }
     }
 
+    function runback() external onlyAuthorizedExecutor {
+        uint256 balance = IERC20(WETH).balanceOf(address(this));
+        require(balance > INVENTORY_FLOOR, "BELOW_FLOOR");
+
+        uint256 excess = balance - INVENTORY_FLOOR;
+
+        IWETH(WETH).withdraw(excess);
+
+        (bool success, ) = msg.sender.call{value: excess}("");
+        require(success, "TRANSFER_FAILED");
+    }
+
+    receive() external payable {}
+
     function setLegacyRouter(address _legacyRouter) external onlyMultisig {
         legacyRouter = IRouter(_legacyRouter);
     }
 
     function setSwapRouter(address _swapRouter) external onlyMultisig {
         swapRouter = ISwapRouter(_swapRouter);
+    }
+
+    /**
+     * @notice Rescue ERC20 tokens stuck in the contract
+     * @dev Only callable by the multisig
+     * @param _token The ERC20 token address to rescue
+     * @param _amount The amount of tokens to transfer
+     */
+    function clawBackToMultisig(address _token, uint256 _amount) external onlyMultisig {
+        IERC20(_token).transfer(RAMSES_MULTISIG, _amount);
     }
 }
 

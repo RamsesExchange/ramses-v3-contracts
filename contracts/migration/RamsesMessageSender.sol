@@ -49,6 +49,9 @@ contract RamsesMessageSender is IRamsesMessageSender, Initializable, OAppUpgrade
     /// @dev veRAM contract address on Arbitrum
     IVeRam public constant VE_RAM = IVeRam(0xAAA343032aA79eE9a6897Dab03bef967c3289a06);
 
+    /// @dev dust threshold for balance mismatch due to rounding errors (1e18 wei)
+    uint256 public constant DUST_THRESHOLD = 1e18;
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor(address _endpoint) OAppUpgradeable(_endpoint) {
         _disableInitializers();
@@ -127,7 +130,7 @@ contract RamsesMessageSender is IRamsesMessageSender, Initializable, OAppUpgrade
         /// @dev fetch the veNFT's balance and verify it meets minimum requirement
         (int128 intBalance,) = VE_RAM.locked(_veID);
         uint256 trueBalance = uint256(uint128(intBalance));
-        require(trueBalance >= userData.veRamLocked, "balance mismatch");
+        require(trueBalance >= userData.veRamLocked - DUST_THRESHOLD, "balance mismatch");
         require(VE_RAM.ownerOf(_veID) == _user, "not owner");
         
         /// @dev zero out allocation before external call

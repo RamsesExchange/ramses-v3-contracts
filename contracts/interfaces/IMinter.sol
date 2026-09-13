@@ -20,6 +20,9 @@ interface IMinter {
     /// @return period the new period
     function updatePeriod() external returns (uint256 period);
 
+    /// @notice update the epoch (period) and rebase -- callable once a week at >= Thursday 0 UTC
+    function updatePeriodAndRebase() external;
+
     /// @notice intialize epoch0 + emissions (immediately active for this week)
     function initEpoch0() external;
 

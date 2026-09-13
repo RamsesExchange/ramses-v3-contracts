@@ -2,6 +2,9 @@
 pragma solidity ^0.8.0;
 
 interface IRouter {
+    /// @notice returns the address of the pair factory
+    function factory() external view returns (address);
+
     struct route {
         /// @dev token from
         address from;

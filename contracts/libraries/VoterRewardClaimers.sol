@@ -12,6 +12,7 @@ import {Errors} from "contracts/libraries/Errors.sol";
 import {IPair} from "contracts/interfaces/IPair.sol";
 import {IPairFactory} from "contracts/interfaces/IPairFactory.sol";
 import {IRouter} from "contracts/interfaces/IRouter.sol";
+import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 import {VoterStorage} from "contracts/libraries/VoterStorage.sol";
 
@@ -19,6 +20,8 @@ import {VoterStorage} from "contracts/libraries/VoterStorage.sol";
 /// @notice Reward claimers logic for Voter
 /// @dev Used to reduce Voter contract size by moving all reward claiming logic to a library
 library VoterRewardClaimers {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
     /// @dev function for claiming CL rewards with multiple ownership/access checks
     /// @notice Legacy version - uses single nfpManager from VoterStorage
     function claimClGaugeRewards(
@@ -55,12 +58,18 @@ library VoterRewardClaimers {
         uint256[][] calldata _nfpTokenIds,
         address[] calldata _nfpManagers
     ) external {
-        require(_gauges.length == _nfpManagers.length, "Length mismatch");
-        
+        require(_gauges.length == _tokens.length, Errors.LENGTH_MISMATCH());
+        require(_gauges.length == _nfpTokenIds.length, Errors.LENGTH_MISMATCH());
+        require(_gauges.length == _nfpManagers.length, Errors.LENGTH_MISMATCH());
+
+        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
+
         for (uint256 i; i < _gauges.length; ++i) {
+            require(_isAuthorizedClaimer($, _nfpManagers[i]), Errors.NOT_AUTHORIZED_CLAIMER(_nfpManagers[i]));
+
             INonfungiblePositionManager nfpManagerContract =
                 INonfungiblePositionManager(_nfpManagers[i]);
-            
+
             for (uint256 j; j < _nfpTokenIds[i].length; ++j) {
                 require(
                     msg.sender == nfpManagerContract.ownerOf(_nfpTokenIds[i][j])
@@ -79,6 +88,11 @@ library VoterRewardClaimers {
         }
     }
 
+    function _isAuthorizedClaimer(VoterStorage.VoterState storage $, address claimer) private view returns (bool) {
+        if ($.authorizedClaimers.contains(claimer)) return true;
+
+        return $.authorizedClaimers.length() == 0 && claimer == $.nfpManager && claimer != address(0);
+    }
 
     /// @dev claims voting incentives batched
     function claimIncentives(address owner, address[] calldata _feeDistributors, address[][] calldata _tokens)

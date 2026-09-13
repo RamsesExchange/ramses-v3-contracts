@@ -10,6 +10,7 @@ import {IR33} from "contracts/interfaces/IR33.sol";
 import {IRamsesV3Factory} from "contracts/CL/core/interfaces/IRamsesV3Factory.sol";
 import {IPairFactory} from "contracts/interfaces/IPairFactory.sol";
 import {IFeeCollector} from "contracts/CL/gauge/interfaces/IFeeCollector.sol";
+import {IAutoVault} from "contracts/autovault/interfaces/IAutoVault.sol";
 
 interface IAccessHub {
     error SAME_ADDRESS();
@@ -50,7 +51,7 @@ interface IAccessHub {
     /// @notice weekly emissions minter
     function minter() external view returns (IMinter minter);
 
-    /// @notice xRam contract  
+    /// @notice xRam contract
     function xRam() external view returns (IXRam xRam);
 
     /// @notice R33 contract
@@ -84,8 +85,7 @@ interface IAccessHub {
     function reinit(InitParams calldata params) external;
 
     /// @notice sets the swap fees for multiple pairs
-    function setSwapFees(address[] calldata _pools, uint24[] calldata _swapFees)
-        external;
+    function setSwapFees(address[] calldata _pools, uint24[] calldata _swapFees) external;
 
     /// @notice sets the split of fees between LPs and voters
     function setFeeSplitCL(address[] calldata _pools, uint24[] calldata _feeProtocol) external;
@@ -123,7 +123,50 @@ interface IAccessHub {
     function createLegacyGauge(address _pool) external returns (address);
 
     /// @notice creates a new concentrated liquidity gauge for a CL pool
-    function createCLGauge(address tokenA, address tokenB, int24 tickSpacing, bool forceVoterFees) external returns (address);
+    function createCLGauge(address tokenA, address tokenB, int24 tickSpacing, bool forceVoterFees)
+        external
+        returns (address);
+
+    /// @notice sets the DLMM factory in Voter
+    function setDLMMFactoryInVoter(address _dlmmFactory) external;
+
+    /// @notice sets the DLMM rewarder factory in Voter
+    function setDLMMRewarderFactoryInVoter(address _dlmmRewarderFactory) external;
+
+    /// @notice updates the beacon implementation used by DLMM rewarders
+    function setDLMMRewarderFactoryImpl(address _newImplementation) external;
+
+    /// @notice grants or revokes the active DLMM factory hooks-manager role
+    function setDLMMHooksManager(address _manager, bool _enabled) external;
+
+    /// @notice accepts ownership of the active DLMM factory after it has been transferred to AccessHub
+    function acceptDLMMFactoryOwnership() external;
+
+    /// @notice creates a new team-gated DLMM pool through the active DLMM factory
+    function createDLMMPool(address tokenX, address tokenY, uint24 activeId, uint16 binStep)
+        external
+        returns (address pool);
+
+    /// @notice creates and registers a RAM rewarder for an existing DLMM pool
+    function createDLMMRewarder(address pool) external returns (address rewarder);
+
+    /// @notice sets protocol fee shares for existing DLMM pools
+    function setFeeSplitDLMM(address[] calldata _pools, uint16[] calldata _protocolShares) external;
+
+    /// @notice sets the default fee split for future DLMM pools using this bin step preset
+    function setGlobalDLMMFeeSplit(uint16 binStep, uint16 protocolShare) external;
+
+    /// @notice sets the rewarded bin range for a registered DLMM rewarder
+    function setDLMMRewarderDeltaBins(address _rewarder, int24 _deltaBinA, int24 _deltaBinB) external;
+
+    /// @notice sets the treasury address in the active DLMM fee collector
+    function setTreasuryInDLMMFeeCollector(address newTreasury) external;
+
+    /// @notice sets the treasury fee split in the active DLMM fee collector
+    function setTreasuryFeesInDLMMFeeCollector(uint256 _treasuryFees) external;
+
+    /// @notice sets the voter address in the active DLMM fee collector
+    function setVoterInDLMMFeeCollector(address _voter) external;
 
     /**
      * xRam Functions
@@ -134,12 +177,6 @@ interface IAccessHub {
 
     /// @notice enables or disables the transfer whitelist in xRam
     function transferToWhitelistInXRam(address[] calldata _who, bool[] calldata _whitelisted) external;
-
-    /// @notice enables or disables the governance in xRam
-    function toggleXRamGovernance(bool enable) external;
-
-    /// @notice rescues any trapped tokens in xRam
-    function rescueTrappedTokens(address[] calldata _tokens, uint256[] calldata _amounts) external;
 
     /**
      * X33 Functions
@@ -242,7 +279,6 @@ interface IAccessHub {
     /// @notice sets the address of the voter in the fee recipient factory for fee recipient creation
     function setVoterInFeeRecipientFactory(address _voter) external;
 
-
     /**
      * Timelock gated functions
      */
@@ -254,10 +290,7 @@ interface IAccessHub {
     function setNewTimelock(address _timelock) external;
 
     /// @notice function for initializing the voter contract with its dependencies
-    function initializeVoter(
-        IVoter.InitializationParams memory inputs
-    ) external;
-
+    function initializeVoter(IVoter.InitializationParams memory inputs) external;
 
     /// @notice this function helps us manage atomic r33 self-compounding without manual hassle
     function compoundR33() external;
@@ -278,7 +311,6 @@ interface IAccessHub {
     /// @param _nfpManager The address of the new NfpManager contract
     function setRewardValidatorNfpManager(address _nfpManager) external;
 
-
     /// @notice set the nfp manager
     /// @param _nfpManager The address of the NfpManager contract
     function setNfpManager(address _nfpManager) external;
@@ -290,10 +322,18 @@ interface IAccessHub {
     /// @notice add an authorized claimer to the voter
     /// @param _claimer The address of the authorized claimer
     function addAuthorizedClaimerVoter(address _claimer) external;
-    
+
     /// @notice remove an authorized claimer from the voter
     /// @param _claimer The address of the authorized claimer to remove
     function removeAuthorizedClaimerVoter(address _claimer) external;
+
+    /// @notice add an authorized DLMM liquidity manager to the voter
+    /// @param _manager The address of the authorized DLMM manager
+    function addAuthorizedDLMMManagerVoter(address _manager) external;
+
+    /// @notice remove an authorized DLMM liquidity manager from the voter
+    /// @param _manager The address of the authorized DLMM manager to remove
+    function removeAuthorizedDLMMManagerVoter(address _manager) external;
 
     function syncClGaugesBatch(uint256 startIndex, uint256 endIndex) external;
 
@@ -316,4 +356,41 @@ interface IAccessHub {
     /// @param _gauges Array of gauge addresses to remove rewards from
     /// @param _rewards Array of reward token addresses to remove
     function batchRemoveRewardsFromGauges(address[] calldata _gauges, address[] calldata _rewards) external;
+
+    /**
+     * AutoVault Functions
+     */
+
+    /// @notice AutoVault contract
+    function autoVault() external view returns (IAutoVault);
+
+    /// @notice sets the AutoVault contract address
+    /// @param _autoVault the AutoVault contract address
+    function setAutoVault(address _autoVault) external;
+
+    /// @notice adds an output token to the AutoVault whitelist
+    /// @param _token the token address to add
+    function addOutputTokenAutoVault(address _token) external;
+
+    /// @notice removes an output token from the AutoVault whitelist
+    /// @param _token the token address to remove
+    /// @param _force if true, wipes orphaned budgets instead of reverting
+    function removeOutputTokenAutoVault(address _token, bool _force) external;
+
+    /// @notice adds an aggregator to the AutoVault whitelist
+    /// @param _aggregator the aggregator address to add
+    function addAggregatorAutoVault(address _aggregator) external;
+
+    /// @notice removes an aggregator from the AutoVault whitelist
+    /// @param _aggregator the aggregator address to remove
+    function removeAggregatorAutoVault(address _aggregator) external;
+
+    /// @notice sets the operator address in the AutoVault
+    /// @param _operator the new operator address
+    function setOperatorAutoVault(address _operator) external;
+
+    /// @notice rescues stuck tokens from the AutoVault
+    /// @param _token the token address to rescue
+    /// @param _amount the amount to rescue
+    function rescueAutoVault(address _token, uint256 _amount) external;
 }

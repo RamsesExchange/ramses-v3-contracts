@@ -62,6 +62,14 @@ library Errors {
     /// @notice Thrown when vote operation fails
     error VOTE_UNSUCCESSFUL();
 
+    /// @notice Thrown when an item already exists in a set
+    /// @param item The duplicate item
+    error ALREADY_ADDED(address item);
+
+    /// @notice Thrown when an item is missing from a set
+    /// @param item The missing item
+    error NOT_FOUND(address item);
+
     /*//////////////////////////////////////////////////////////////
                             GAUGE V3 ERRORS
     //////////////////////////////////////////////////////////////*/

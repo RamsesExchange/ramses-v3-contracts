@@ -2,8 +2,9 @@
 pragma solidity ^0.8.26;
 
 import {IAccessHub} from "./interfaces/IAccessHub.sol";
-import {AccessControlEnumerableUpgradeable} from
-    "@openzeppelin/contracts-upgradeable/access/extensions/AccessControlEnumerableUpgradeable.sol";
+import {
+    AccessControlEnumerableUpgradeable
+} from "@openzeppelin/contracts-upgradeable/access/extensions/AccessControlEnumerableUpgradeable.sol";
 
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
@@ -32,12 +33,13 @@ import {ITransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transp
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPair} from "./interfaces/IPair.sol";
 import {IRouter} from "./interfaces/IRouter.sol";
+import {IAutoVault} from "./autovault/interfaces/IAutoVault.sol";
+import {AccessHubDLMMActions} from "./libraries/AccessHubDLMMActions.sol";
 
 contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradeable {
     /**
      * Start of Storage Slots
      */
-
     /// @notice role that can call changing fee splits and swap fees
     bytes32 public constant SWAP_FEE_SETTER = keccak256("SWAP_FEE_SETTER");
     /// @notice operator role
@@ -84,6 +86,8 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     IVoteModule public voteModule;
     /// @notice nonFungiblePositionManager contract
     INonfungiblePositionManager public nfpManager;
+    /// @notice AutoVault contract
+    IAutoVault public autoVault;
 
     /**
      * End of Storage Slots
@@ -147,12 +151,8 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     }
 
     /// @inheritdoc IAccessHub
-    function initializeVoter(
-        IVoter.InitializationParams memory inputs
-    ) external onlyMultisig {
-        voter.initialize(
-            inputs
-        );
+    function initializeVoter(IVoter.InitializationParams memory inputs) external onlyMultisig {
+        voter.initialize(inputs);
     }
 
     /**
@@ -174,15 +174,10 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     }
 
     /// @inheritdoc IAccessHub
-    function setFeeSplitCL(address[] calldata _pools, uint24[] calldata _feeProtocol)
-        external
-    {
+    function setFeeSplitCL(address[] calldata _pools, uint24[] calldata _feeProtocol) external {
         /// @dev allow either SWAP_FEE_SETTER role holders OR the voter contract
-        require(
-            hasRole(SWAP_FEE_SETTER, msg.sender) || msg.sender == address(voter),
-            Errors.NOT_AUTHORIZED(msg.sender)
-        );
-        
+        require(hasRole(SWAP_FEE_SETTER, msg.sender) || msg.sender == address(voter), Errors.NOT_AUTHORIZED(msg.sender));
+
         /// @dev ensure continuity of length
         require(_pools.length == _feeProtocol.length, Errors.LENGTH_MISMATCH());
         for (uint256 i; i < _pools.length; ++i) {
@@ -191,15 +186,10 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     }
 
     /// @inheritdoc IAccessHub
-    function setFeeSplitLegacy(address[] calldata _pools, uint256[] calldata _feeSplits)
-        external
-    {
+    function setFeeSplitLegacy(address[] calldata _pools, uint256[] calldata _feeSplits) external {
         /// @dev allow either SWAP_FEE_SETTER role holders OR the voter contract
-        require(
-            hasRole(SWAP_FEE_SETTER, msg.sender) || msg.sender == address(voter),
-            Errors.NOT_AUTHORIZED(msg.sender)
-        );
-        
+        require(hasRole(SWAP_FEE_SETTER, msg.sender) || msg.sender == address(voter), Errors.NOT_AUTHORIZED(msg.sender));
+
         /// @dev ensure continuity of length
         require(_pools.length == _feeSplits.length, Errors.LENGTH_MISMATCH());
         for (uint256 i; i < _pools.length; ++i) {
@@ -208,7 +198,10 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     }
 
     /// @notice sets the fee recipient for legacy pairs
-    function setFeeRecipientLegacyBatched(address[] calldata _pairs, address[] calldata _feeRecipients) external onlyMultisig {
+    function setFeeRecipientLegacyBatched(address[] calldata _pairs, address[] calldata _feeRecipients)
+        external
+        onlyMultisig
+    {
         require(_pairs.length == _feeRecipients.length, Errors.LENGTH_MISMATCH());
         for (uint256 i; i < _pairs.length; ++i) {
             poolFactory.setFeeRecipient(_pairs[i], _feeRecipients[i]);
@@ -250,8 +243,11 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
         for (uint256 i; i < _pairs.length; ++i) {
             /// @dev store pair
             address pair = _pairs[i];
+            address gauge = voter.gaugeForPool(pair);
             /// @dev collect fees based on pool type
-            if (ramsesV3PoolFactory.isPairV3(pair)) {
+            if (voter.isDLMMRewarder(gauge)) {
+                AccessHubDLMMActions.collectFees(voter, pair);
+            } else if (ramsesV3PoolFactory.isPairV3(pair)) {
                 // V3 pool: collect protocol fees
                 feeCollector.collectProtocolFees(pair);
             } else if (poolFactory.isPair(pair)) {
@@ -263,7 +259,7 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
                 }
             }
             /// @dev kill the gauge
-            voter.killGauge(voter.gaugeForPool(pair));
+            voter.killGauge(gauge);
             // voter will handle the fee split on epoch flip
         }
     }
@@ -272,8 +268,11 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     function reviveGauge(address[] calldata _pairs) external onlyRole(PROTOCOL_OPERATOR) {
         for (uint256 i; i < _pairs.length; ++i) {
             address pair = _pairs[i];
+            address gauge = voter.gaugeForPool(pair);
             /// @dev collect fees based on pool type
-            if (ramsesV3PoolFactory.isPairV3(pair)) {
+            if (voter.isDLMMRewarder(gauge)) {
+                AccessHubDLMMActions.collectFees(voter, pair);
+            } else if (ramsesV3PoolFactory.isPairV3(pair)) {
                 // V3 pool: collect protocol fees
                 feeCollector.collectProtocolFees(pair);
             } else if (poolFactory.isPair(pair)) {
@@ -285,7 +284,7 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
                 }
             }
             /// @dev revive the pair
-            voter.reviveGauge(voter.gaugeForPool(pair));
+            voter.reviveGauge(gauge);
             /// @dev set fee to the factory default only for V3 pools
             if (ramsesV3PoolFactory.isPairV3(pair)) {
                 ramsesV3PoolFactory.setPoolFeeProtocol(pair, ramsesV3PoolFactory.feeProtocol());
@@ -321,13 +320,91 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
         returns (address)
     {
         address gauge = voter.createCLGauge(tokenA, tokenB, tickSpacing);
-        
+
         if (forceVoterFees) {
             address pool = voter.poolForGauge(gauge);
             ramsesV3PoolFactory.setPoolFeeProtocol(pool, 1_000_000);
         }
-        
+
         return gauge;
+    }
+
+    /// @inheritdoc IAccessHub
+    function setDLMMFactoryInVoter(address newDLMMFactory) external onlyMultisig {
+        voter.setDLMMFactory(newDLMMFactory);
+    }
+
+    /// @inheritdoc IAccessHub
+    function setDLMMRewarderFactoryInVoter(address newDLMMRewarderFactory) external onlyMultisig {
+        voter.setDLMMRewarderFactory(newDLMMRewarderFactory);
+    }
+
+    /// @inheritdoc IAccessHub
+    function setDLMMRewarderFactoryImpl(address newImplementation) external onlyMultisig {
+        AccessHubDLMMActions.setRewarderFactoryImplementation(voter, newImplementation);
+    }
+
+    /// @inheritdoc IAccessHub
+    function setDLMMHooksManager(address manager, bool enabled) external onlyMultisig {
+        AccessHubDLMMActions.setHooksManager(voter, manager, enabled);
+    }
+
+    /// @inheritdoc IAccessHub
+    function acceptDLMMFactoryOwnership() external onlyMultisig {
+        AccessHubDLMMActions.acceptFactoryOwnership(voter);
+    }
+
+    /// @inheritdoc IAccessHub
+    function createDLMMPool(address tokenX, address tokenY, uint24 activeId, uint16 binStep)
+        external
+        onlyRole(PROTOCOL_OPERATOR)
+        returns (address pool)
+    {
+        pool = AccessHubDLMMActions.createPool(voter, tokenX, tokenY, activeId, binStep);
+    }
+
+    /// @inheritdoc IAccessHub
+    function createDLMMRewarder(address pool) external onlyRole(PROTOCOL_OPERATOR) returns (address rewarder) {
+        rewarder = voter.createDLMMRewarder(pool);
+    }
+
+    /// @inheritdoc IAccessHub
+    function setDLMMRewarderDeltaBins(address _rewarder, int24 _deltaBinA, int24 _deltaBinB) external onlyMultisig {
+        voter.setDLMMRewarderDeltaBins(_rewarder, _deltaBinA, _deltaBinB);
+    }
+
+    /// @inheritdoc IAccessHub
+    function setTreasuryInDLMMFeeCollector(address newTreasury) external onlyRole(PROTOCOL_OPERATOR) {
+        AccessHubDLMMActions.setTreasury(voter, newTreasury);
+    }
+
+    /// @inheritdoc IAccessHub
+    function setTreasuryFeesInDLMMFeeCollector(uint256 _treasuryFees) external onlyRole(PROTOCOL_OPERATOR) {
+        AccessHubDLMMActions.setTreasuryFees(voter, _treasuryFees);
+    }
+
+    /// @inheritdoc IAccessHub
+    function setVoterInDLMMFeeCollector(address _voter) external onlyMultisig {
+        AccessHubDLMMActions.setVoter(voter, _voter);
+    }
+
+    /// @inheritdoc IAccessHub
+    function setFeeSplitDLMM(address[] calldata _pools, uint16[] calldata _protocolShares) external {
+        require(hasRole(SWAP_FEE_SETTER, msg.sender) || msg.sender == address(voter), Errors.NOT_AUTHORIZED(msg.sender));
+        AccessHubDLMMActions.setFeeSplit(voter, _pools, _protocolShares);
+    }
+
+    /// @notice sets DLMM pool base factors while preserving the rest of each pool's fee parameters
+    function setSwapBaseFeeDLMM(address[] calldata _pools, uint16[] calldata _baseFactors)
+        external
+        onlyRole(SWAP_FEE_SETTER)
+    {
+        AccessHubDLMMActions.setSwapBaseFee(voter, _pools, _baseFactors);
+    }
+
+    /// @inheritdoc IAccessHub
+    function setGlobalDLMMFeeSplit(uint16 binStep, uint16 protocolShare) external onlyMultisig {
+        AccessHubDLMMActions.setGlobalFeeSplit(voter, binStep, protocolShare);
     }
 
     /**
@@ -337,6 +414,7 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     function setFeeCollectorAccessHub(address _feeCollector) external onlyMultisig {
         feeCollector = IFeeCollector(_feeCollector);
     }
+
     function setFeeCollectorInClGaugeFactory(address _feeCollector) external onlyMultisig {
         ClGaugeFactory(clGaugeFactory).setFeeCollector(_feeCollector);
     }
@@ -362,23 +440,8 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     }
 
     /// @inheritdoc IAccessHub
-    function toggleXRamGovernance(bool enable) external onlyRole(PROTOCOL_OPERATOR) {
-        /// @dev if enabled we call unpause otherwise we pause to disable
-        enable ? xRam.unpause() : xRam.pause();
-    }
-
-
-    /// @inheritdoc IAccessHub
     function transferOperatorInXRam(address _operator) external onlyRole(PROTOCOL_OPERATOR) {
         xRam.migrateOperator(_operator);
-    }
-
-    /// @inheritdoc IAccessHub
-    function rescueTrappedTokens(address[] calldata _tokens, uint256[] calldata _amounts)
-        external
-        onlyRole(PROTOCOL_OPERATOR)
-    {
-        xRam.rescueTrappedTokens(_tokens, _amounts);
     }
 
     /**
@@ -394,9 +457,9 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     /// @inheritdoc IAccessHub
     function transferOperatorInR33(address _newOperator) external onlyRole(PROTOCOL_OPERATOR) {
         r33.transferOperator(_newOperator);
-        
     }
- // @inheritdoc IAccessHub
+
+    // @inheritdoc IAccessHub
     function compoundR33() external onlyRole(SWAP_FEE_SETTER) {
         // Whitelist AccessHub as xRam sender temporarily (to allow transferring xRam back to r33)
         address[] memory who = new address[](1);
@@ -404,31 +467,30 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
         who[0] = address(this);
         whitelisted[0] = true;
         xRam.setExemption(who, whitelisted);
-        
+
         // Cache original operator
         address r33Operator = r33.operator();
-        
+
         // Temporarily make AccessHub the operator of r33
         r33.transferOperator(address(this));
-        
+
         // Rescue rex33 tokens from r33 contract to AccessHub
         uint256 r33Balance = r33.balanceOf(address(r33));
         if (r33Balance > 0) {
             r33.rescue(address(r33), r33Balance);
-            
+
             // Redeem rex33 for xRam (receives xRam at AccessHub)
             IERC4626(address(r33)).redeem(r33Balance, address(this), address(this));
-            
+
             // Transfer xRam back to r33 contract
             uint256 xRamAmount = xRam.balanceOf(address(this));
             IERC20(address(xRam)).transfer(address(r33), xRamAmount);
-
         }
-        
+
         // Remove AccessHub from whitelist
         whitelisted[0] = false;
         xRam.setExemption(who, whitelisted);
-        
+
         // Restore r33 operator
         r33.transferOperator(r33Operator);
     }
@@ -439,7 +501,7 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     /// @return tokenA token0 address
     /// @return tokenB token1 address
     function _tryUnwrapLP(address token) internal returns (bool isLP, address tokenA, address tokenB) {
-        address LEGACY_ROUTER = 0x9CEE04bDcE127DA7E448A333f006DEFb3d5e38cC;
+        address LEGACY_ROUTER = 0xdcC44285fBc236457A5cd91C2f77AD8421B0D8ED;
         try IPair(token).token0() returns (address token0) {
             address token1 = IPair(token).token1();
             uint256 lpBalance = IERC20(token).balanceOf(address(this));
@@ -448,16 +510,17 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
                 // approve legacy router to spend LP tokens
                 IERC20(token).approve(LEGACY_ROUTER, lpBalance);
                 // remove liquidity
-                IRouter(LEGACY_ROUTER).removeLiquidity(
-                    token0,
-                    token1,
-                    IPair(token).stable(),
-                    lpBalance,
-                    0, // amountAMin
-                    0, // amountBMin
-                    address(this),
-                    block.timestamp
-                );
+                IRouter(LEGACY_ROUTER)
+                    .removeLiquidity(
+                        token0,
+                        token1,
+                        IPair(token).stable(),
+                        lpBalance,
+                        0, // amountAMin
+                        0, // amountBMin
+                        address(this),
+                        block.timestamp
+                    );
 
                 return (true, token0, token1);
             }
@@ -465,18 +528,19 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
             return (false, address(0), address(0));
         }
     }
+
     function unwrapR33LegacyIncentives(address _lpToken) external onlyRole(SWAP_FEE_SETTER) {
         // verify we are dealing with a legitimate non-poisoned contract
         require(poolFactory.isPair(_lpToken), "INVALID_LP_TOKEN");
-        
+
         // rescue LP to AccessHub
         uint256 lpAmount = IERC20(_lpToken).balanceOf(address(r33));
         r33.rescue(_lpToken, lpAmount);
-        
+
         // unwrap the lp into token0 and token1
         (bool isLP, address token0, address token1) = _tryUnwrapLP(_lpToken);
         require(isLP, "UNWRAP_FAILED");
-        
+
         // transfer unwrapped tokens back to r33
         uint256 token0Balance = IERC20(token0).balanceOf(address(this));
         uint256 token1Balance = IERC20(token1).balanceOf(address(this));
@@ -488,7 +552,6 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     function whitelistAggregatorInR33(address _aggregator, bool _status) external onlyMultisig {
         r33.whitelistAggregator(_aggregator, _status);
     }
-
 
     /**
      * Minter Functions
@@ -570,17 +633,15 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
         ramsesV3PoolFactory.setFeeCollector(_newFeeCollector);
     }
 
-      /// @notice Update FeeDistributor for a gauge (emergency governance function)
+    /// @notice Update FeeDistributor for a gauge (emergency governance function)
     function updateFeeDistributorForGauge(address _gauge, address _newFeeDistributor) external onlyMultisig {
         voter.updateFeeDistributorForGauge(_gauge, _newFeeDistributor);
-
     }
 
     /// @notice Create a new FeeDistributor with specified feeRecipient (emergency governance function)
     function createFeeDistributorWithRecipient(address _feeRecipient) external onlyMultisig returns (address) {
         return voter.createFeeDistributorWithRecipient(_feeRecipient);
     }
-
 
     /**
      * Legacy Pool Factory functions
@@ -590,7 +651,6 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     function setTreasuryInLegacyFactory(address _treasury) external onlyMultisig {
         poolFactory.setTreasury(_treasury);
     }
-
 
     /// @inheritdoc IAccessHub
     function setVoterInLegacyFactory(address _voter) external onlyMultisig {
@@ -617,8 +677,6 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
         poolFactory.setSkimEnabled(_pair, _status);
     }
 
-    
-
     /**
      * VoteModule Functions
      */
@@ -629,7 +687,6 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
             voteModule.setCooldownExemption(_candidates[i], _exempt[i]);
         }
     }
-
 
     /// @inheritdoc IAccessHub
     function setNewVoteModuleCooldown(uint256 _newCooldown) external timelocked {
@@ -654,7 +711,7 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
 
     function setClGaugeFactoryImpl(address _newImplementation) public onlyMultisig {
         ClGaugeFactory(clGaugeFactory).setImplementation(_newImplementation);
-    } 
+    }
 
     /// @notice toggle anti-sybil mechanism
     function toggleAntiSybil() external onlyMultisig {
@@ -675,19 +732,14 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
         IRewardValidator(rewardValidator).setNfpManager(_nfpManager);
     }
 
-
     /// @notice set the nfp manager
     /// @param _nfpManager The address of the NfpManager contract
     function setNfpManager(address _nfpManager) external onlyMultisig {
         voter.setNfpManager(_nfpManager);
     }
 
-
     /// @notice clawback bribes/incentives from a FeeDistributor for the next period
-    function clawbackIncentives(address _tokenToClawback, address _poolAddress) 
-        external 
-        onlyMultisig
-    {
+    function clawbackIncentives(address _tokenToClawback, address _poolAddress) external onlyMultisig {
         address feeDistributor = voter.feeDistributorForGauge(voter.gaugeForPool(_poolAddress));
         IFeeDistributor(feeDistributor).clawbackRewards(_tokenToClawback, address(treasury));
     }
@@ -698,6 +750,14 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
 
     function removeAuthorizedClaimerVoter(address _claimer) external onlyMultisig {
         voter.removeAuthorizedClaimer(_claimer);
+    }
+
+    function addAuthorizedDLMMManagerVoter(address _manager) external onlyMultisig {
+        voter.addAuthorizedDLMMManager(_manager);
+    }
+
+    function removeAuthorizedDLMMManagerVoter(address _manager) external onlyMultisig {
+        voter.removeAuthorizedDLMMManager(_manager);
     }
 
     /// @inheritdoc IAccessHub
@@ -711,7 +771,10 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     }
 
     /// @inheritdoc IAccessHub
-    function batchAddRewardsToGauges(address[] calldata _gauges, address[] calldata _rewards) external onlyRole(PROTOCOL_OPERATOR) {
+    function batchAddRewardsToGauges(address[] calldata _gauges, address[] calldata _rewards)
+        external
+        onlyRole(PROTOCOL_OPERATOR)
+    {
         require(_gauges.length == _rewards.length, Errors.LENGTH_MISMATCH());
         for (uint256 i = 0; i < _gauges.length; i++) {
             IGaugeV3(_gauges[i]).addRewards(_rewards[i]);
@@ -719,7 +782,10 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     }
 
     /// @inheritdoc IAccessHub
-    function batchRemoveRewardsFromGauges(address[] calldata _gauges, address[] calldata _rewards) external onlyRole(PROTOCOL_OPERATOR) {
+    function batchRemoveRewardsFromGauges(address[] calldata _gauges, address[] calldata _rewards)
+        external
+        onlyRole(PROTOCOL_OPERATOR)
+    {
         require(_gauges.length == _rewards.length, Errors.LENGTH_MISMATCH());
         for (uint256 i = 0; i < _gauges.length; i++) {
             IGaugeV3(_gauges[i]).removeRewards(_rewards[i]);
@@ -729,13 +795,13 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
     function syncClGaugesBatch(uint256 startIndex, uint256 endIndex) external onlyMultisig {
         address[] memory allGauges = voter.getAllGauges();
         uint256 gaugesLength = allGauges.length;
-        
+
         if (endIndex == 0 || endIndex > gaugesLength) {
             endIndex = gaugesLength;
         }
-        
+
         require(startIndex < endIndex, "Invalid index range");
-        
+
         for (uint256 i = startIndex; i < endIndex; i++) {
             if (voter.isClGauge(allGauges[i])) {
                 try IGaugeV3(allGauges[i]).syncCache() {} catch {}
@@ -743,4 +809,43 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
         }
     }
 
+    /**
+     * AutoVault Functions
+     */
+
+    /// @inheritdoc IAccessHub
+    function setAutoVault(address _autoVault) external onlyMultisig {
+        autoVault = IAutoVault(_autoVault);
+    }
+
+    /// @inheritdoc IAccessHub
+    function addOutputTokenAutoVault(address _token) external onlyMultisig {
+        autoVault.addOutputToken(_token);
+    }
+
+    /// @inheritdoc IAccessHub
+    function removeOutputTokenAutoVault(address _token, bool _force) external onlyMultisig {
+        autoVault.removeOutputToken(_token, _force);
+    }
+
+    /// @inheritdoc IAccessHub
+    function addAggregatorAutoVault(address _aggregator) external onlyMultisig {
+        autoVault.addAggregator(_aggregator);
+    }
+
+    /// @inheritdoc IAccessHub
+    function removeAggregatorAutoVault(address _aggregator) external onlyMultisig {
+        autoVault.removeAggregator(_aggregator);
+    }
+
+    /// @inheritdoc IAccessHub
+    function setOperatorAutoVault(address _operator) external onlyMultisig {
+        autoVault.setOperator(_operator);
+    }
+
+    /// @inheritdoc IAccessHub
+    function rescueAutoVault(address _token, uint256 _amount) external onlyMultisig {
+        autoVault.rescue(_token, _amount);
+        IERC20(_token).transfer(treasury, _amount);
+    }
 }
