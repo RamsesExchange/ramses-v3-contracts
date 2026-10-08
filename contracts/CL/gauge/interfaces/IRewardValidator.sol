@@ -11,7 +11,7 @@ interface IRewardValidator {
      * @param _index The index/tokenId of the position
      * @param _tickLower The lower tick of the position
      * @param _tickUpper The upper tick of the position
-     * @return bool Returns true if the reward should be slashed to r33, false if normal claim
+     * @return bool Returns true if the reward should be slashed (to r33 if set, else the fee collector treasury), false if normal claim
      */
     function validateReward(
         address _owner,

@@ -678,6 +678,14 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
     }
 
     /// @inheritdoc IVoter
+    function setTimeThresholdForGauge(address _gauge, uint256 _timeThreshold) external onlyGovernance {
+        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
+        require($.isClGauge[_gauge] || $.isDLMMRewarder[_gauge], Errors.INVALID_CONTRACT());
+        $.timeThresholdForGauge[_gauge] = _timeThreshold;
+        emit TimeThresholdForGaugeSet(_gauge, _timeThreshold);
+    }
+
+    /// @inheritdoc IVoter
     function setRewardValidator(address _rewardValidator) external onlyGovernance {
         VoterGovernanceActions.setRewardValidator(_rewardValidator);
     }
@@ -995,6 +1003,13 @@ contract Voter is IVoter, ReentrancyGuard, Initializable {
     /// @inheritdoc IVoter
     function timeThresholdForRewarder() external view returns (uint256) {
         return VoterStorage.getStorage().timeThresholdForRewarder;
+    }
+
+    /// @inheritdoc IVoter
+    function timeThresholdForGauge(address gauge) external view returns (uint256 timeThreshold) {
+        VoterStorage.VoterState storage $ = VoterStorage.getStorage();
+        timeThreshold = $.timeThresholdForGauge[gauge];
+        if (timeThreshold == 0) timeThreshold = $.timeThresholdForRewarder;
     }
 
     /// @inheritdoc IVoter

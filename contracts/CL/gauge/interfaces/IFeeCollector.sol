@@ -26,7 +26,7 @@ interface IFeeCollector {
     );
 
     /// @notice Returns the treasury address.
-    function treasury() external returns (address);
+    function treasury() external view returns (address);
 
     /// @notice Returns the treasury fees ratio.
     function treasuryFees() external returns (uint256);

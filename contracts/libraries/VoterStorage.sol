@@ -84,6 +84,8 @@ library VoterStorage {
         mapping(address rewarder => bool dlmmRewarder) isDLMMRewarder;
         mapping(address manager => bool authorizedDLMMManager) isAuthorizedDLMMManager;
         address dlmmRewarderFactory;
+        /// @dev per-gauge anti-sybil threshold (CL gauge or DLMM rewarder), 0 = use timeThresholdForRewarder
+        mapping(address gauge => uint256 timeThreshold) timeThresholdForGauge;
     }
 
     /// @dev Return state storage struct for reading and writing

@@ -308,6 +308,13 @@ contract AccessHub is IAccessHub, Initializable, AccessControlEnumerableUpgradea
         voter.setTimeThresholdForRewarder(_timeThreshold);
     }
 
+    /// @notice Set a gauge's time threshold (in seconds), overriding timeThresholdForRewarder
+    /// @param _gauge CL gauge or DLMM rewarder
+    /// @param _timeThreshold New time threshold in seconds (0 = use timeThresholdForRewarder)
+    function setTimeThresholdForGauge(address _gauge, uint256 _timeThreshold) external onlyRole(PROTOCOL_OPERATOR) {
+        voter.setTimeThresholdForGauge(_gauge, _timeThreshold);
+    }
+
     /// @inheritdoc IAccessHub
     function createLegacyGauge(address _pool) external onlyRole(PROTOCOL_OPERATOR) returns (address) {
         return voter.createGauge(_pool);

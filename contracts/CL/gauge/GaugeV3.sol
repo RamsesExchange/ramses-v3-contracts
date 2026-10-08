@@ -63,6 +63,14 @@ contract GaugeV3 is IGaugeV3, Initializable {
     IRewardValidator public rewardValidator;
     /// @dev Cached r33 address for gas optimization
     address public r33;
+    uint256 private __reserved;
+
+    struct ForfeitedReward {
+        uint256 period;
+        uint256 amount;
+    }
+
+    mapping(bytes32 => mapping(address => ForfeitedReward)) public forfeitedRewards;
 
     /// @dev Mutually exclusive reentrancy protection into the pool to/from a method. This method also prevents entrance
     /// @dev to a function before the Gauge is initialized.
@@ -119,19 +127,18 @@ contract GaugeV3 is IGaugeV3, Initializable {
             IRamsesV3Pool(_pool).token1()
         );
 
-        rewards.push(token0);
-        rewards.push(token1);
-        rewards.push(xphar);
-        (isReward[token0], isReward[token1], isReward[xphar]) = (true, true, true);
-        
-        /// @dev if token0 and token1 aren't shadow add ram in the records (prevents duplicates)
-        if (token0 != ram && token1 != ram) {
-            rewards.push(ram);
-            isReward[ram] = true;
-        }
+        _addInitialReward(token0);
+        _addInitialReward(token1);
+        _addInitialReward(xphar);
+        _addInitialReward(ram);
+    }
 
-        for (uint256 i; i < rewards.length; i++) {
-            emit RewardAdded(rewards[i]);
+    /// @dev skips zero and duplicate tokens (e.g. xRam unset, or a pool token that is also ram/xRam)
+    function _addInitialReward(address token) private {
+        if (token != address(0) && !isReward[token]) {
+            rewards.push(token);
+            isReward[token] = true;
+            emit RewardAdded(token);
         }
     }
 
@@ -300,7 +307,9 @@ contract GaugeV3 is IGaugeV3, Initializable {
             return 0;
         }
 
-        return abi.decode(data, (uint256));
+        amount = abi.decode(data, (uint256));
+        bytes32 hash = positionHash(owner, index, tickLower, tickUpper);
+        return amount - _forfeitedShare(period, token, hash, amount);
     }
 
     /// @inheritdoc IGaugeV3
@@ -365,9 +374,10 @@ contract GaugeV3 is IGaugeV3, Initializable {
         require(msg.sender == owner, Errors.NOT_AUTHORIZED(msg.sender));
         
         bytes32 _positionHash = positionHash(owner, index, tickLower, tickUpper);
+        pool._advancePeriod();
 
         for (uint256 i = 0; i < tokens.length; ++i) {
-            _getReward(period, tokens[i], owner, index, tickLower, tickUpper, _positionHash, receiver);
+            _getReward(period, tokens[i], owner, index, tickLower, tickUpper, _positionHash, receiver, false);
         }
     }
 
@@ -444,14 +454,99 @@ contract GaugeV3 is IGaugeV3, Initializable {
         address receiver
     ) internal {
         bytes32 _positionHash = positionHash(owner, index, tickLower, tickUpper);
+
+        pool._advancePeriod();
+        if (_shouldSlash(owner, receiver, _positionHash, index, tickLower, tickUpper)) {
+            _recordForfeit(owner, index, tickLower, tickUpper, tokens, _positionHash);
+            emit Forfeited(_positionHash, owner, index, tickLower, tickUpper, tx.origin);
+            return;
+        }
+
+        _claimAll(owner, index, tickLower, tickUpper, tokens, receiver, _positionHash);
+    }
+
+    function _recordForfeit(
+        address owner,
+        uint256 index,
+        int24 tickLower,
+        int24 tickUpper,
+        address[] memory tokens,
+        bytes32 hash
+    ) internal {
+        uint256 period = _blockTimestamp() / WEEK;
+        for (uint256 i; i < tokens.length; ++i) {
+            uint256 unpaid = cachePeriodEarned(period, tokens[i], owner, index, tickLower, tickUpper, false);
+            forfeitedRewards[hash][tokens[i]] = ForfeitedReward(period, unpaid);
+        }
+    }
+
+    function _forfeitedShare(uint256 period, address token, bytes32 hash, uint256 unpaid)
+        internal view returns (uint256)
+    {
+        ForfeitedReward memory debt = forfeitedRewards[hash][token];
+        if (debt.period == 0 || period > debt.period) return 0;
+        return period < debt.period ? unpaid : Math.min(unpaid, debt.amount);
+    }
+
+    function _claimAll(
+        address owner,
+        uint256 index,
+        int24 tickLower,
+        int24 tickUpper,
+        address[] memory tokens,
+        address receiver,
+        bytes32 _positionHash
+    ) internal {
         uint256 currentPeriod = _blockTimestamp() / WEEK;
         uint256 lastClaim;
         for (uint256 i = 0; i < tokens.length; ++i) {
             lastClaim = Math.max(lastClaimByToken[tokens[i]][_positionHash], firstPeriod);
             for (uint256 period = lastClaim; period <= currentPeriod; ++period) {
-                _getReward(period, tokens[i], owner, index, tickLower, tickUpper, _positionHash, receiver);
+                _getReward(period, tokens[i], owner, index, tickLower, tickUpper, _positionHash, receiver, false);
             }
             lastClaimByToken[tokens[i]][_positionHash] = currentPeriod;
+        }
+    }
+
+    function sweepForfeited(
+        address owner,
+        uint256 index,
+        int24 tickLower,
+        int24 tickUpper,
+        address[] calldata tokens
+    ) external lock {
+        pool._advancePeriod();
+        bytes32 _positionHash = positionHash(owner, index, tickLower, tickUpper);
+        for (uint256 i; i < tokens.length; ++i) {
+            uint256 cutoff = forfeitedRewards[_positionHash][tokens[i]].period;
+            uint256 start = Math.max(lastClaimByToken[tokens[i]][_positionHash], firstPeriod);
+            for (uint256 period = start; period <= cutoff; ++period) {
+                _getReward(period, tokens[i], owner, index, tickLower, tickUpper, _positionHash, address(0), true);
+            }
+        }
+    }
+
+    /// @dev r33 where deployed, else the FeeCollector treasury (chains without r33)
+    function _slashRecipient() internal view returns (address recipient) {
+        recipient = r33 != address(0) ? r33 : feeCollector.treasury();
+        require(recipient != address(0), Errors.INVALID_ADDRESS());
+    }
+
+    function _shouldSlash(
+        address owner,
+        address receiver,
+        bytes32 _positionHash,
+        uint256 index,
+        int24 tickLower,
+        int24 tickUpper
+    ) internal view returns (bool) {
+        if (address(rewardValidator) == address(0)) return false;
+        // fail-closed: a cheap validator revert must not buy a payout
+        try rewardValidator.validateReward(owner, receiver, _positionHash, tx.origin, index, tickLower, tickUpper, address(pool))
+        returns (bool slash) {
+            return slash;
+        } catch {
+            return true;
         }
     }
 
@@ -462,23 +557,28 @@ contract GaugeV3 is IGaugeV3, Initializable {
         uint256 index,
         int24 tickLower,
         int24 tickUpper,
-        bytes32 _positionHash,
-        address receiver
+        bytes32 hash,
+        address receiver,
+        bool forfeitedOnly
     ) internal {
-        uint256 _reward = cachePeriodEarned(period, token, owner, index, tickLower, tickUpper, true);
+        uint256 unpaid = cachePeriodEarned(period, token, owner, index, tickLower, tickUpper, true);
+        if (unpaid == 0) return;
 
-        if (_reward > 0) {
-            periodClaimedAmount[period][_positionHash][token] += _reward;
-            
-            // sybil check if rewardValidator is set
-            if (address(rewardValidator) != address(0) && 
-                rewardValidator.validateReward(owner, receiver, _positionHash, tx.origin, index, tickLower, tickUpper, address(pool))) {
-                // slashed to r33
-                receiver = r33;
-            }
-            
-            IERC20(token).safeTransfer(receiver, _reward);
-            emit ClaimRewards(period, _positionHash, receiver, token, _reward);
+        uint256 forfeited = _forfeitedShare(period, token, hash, unpaid);
+        if (!forfeitedOnly && _shouldSlash(owner, receiver, hash, index, tickLower, tickUpper)) forfeited = unpaid;
+        uint256 paid = forfeitedOnly ? 0 : unpaid - forfeited;
+        ForfeitedReward storage debt = forfeitedRewards[hash][token];
+        if (period == debt.period) debt.amount -= Math.min(debt.amount, forfeited);
+        periodClaimedAmount[period][hash][token] += forfeited + paid;
+
+        if (forfeited != 0) {
+            address recipient = _slashRecipient();
+            IERC20(token).safeTransfer(recipient, forfeited);
+            emit ClaimRewards(period, hash, recipient, token, forfeited);
+        }
+        if (paid != 0) {
+            IERC20(token).safeTransfer(receiver, paid);
+            emit ClaimRewards(period, hash, receiver, token, paid);
         }
     }
 

@@ -46,11 +46,20 @@ interface IGaugeV3 {
     /// @notice Emitted when a reward token was removed from the rewards array
     event RewardRemoved(address reward);
 
+    event Forfeited(
+        bytes32 indexed positionHash,
+        address indexed owner,
+        uint256 indexed index,
+        int24 tickLower,
+        int24 tickUpper,
+        address origin
+    );
+
     /// @notice Retrieves the value of the firstPeriod variable.
     /// @return The value of the firstPeriod variable.
     function firstPeriod() external returns (uint256);
     
-    /// @notice Retrieves the cached r33 address for gas optimization
+    /// @notice Cached r33 address; slashes go to r33 when set, otherwise to feeCollector.treasury().
     /// @return The cached r33 address
     function r33() external view returns (address);
 

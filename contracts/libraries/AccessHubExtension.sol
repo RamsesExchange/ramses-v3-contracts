@@ -20,12 +20,26 @@ import {IPair} from "contracts/interfaces/IPair.sol";
 import {IR33} from "contracts/interfaces/IR33.sol";
 import {IRouter} from "contracts/interfaces/IRouter.sol";
 import {IXRam} from "contracts/interfaces/IXRam.sol";
+import {IRamsesV3Factory} from "contracts/CL/core/interfaces/IRamsesV3Factory.sol";
+import {IRamsesV3Pool} from "contracts/CL/core/interfaces/IRamsesV3Pool.sol";
 
 library AccessHubExtension {
     using PairParameterHelper for bytes32;
 
     address internal constant LEGACY_ROUTER = 0x9CEE04bDcE127DA7E448A333f006DEFb3d5e38cC;
     bytes32 internal constant LB_HOOKS_MANAGER_ROLE = keccak256("LB_HOOKS_MANAGER_ROLE");
+
+    /// @dev Runs by delegatecall from the role-gated satellite AccessHub to preserve its authority.
+    function createCLGauge(IVoter voter, IRamsesV3Factory factory, address poolAddress, uint24 initialFeeProtocol)
+        external
+        returns (address gauge)
+    {
+        require(initialFeeProtocol <= 1_000_000, Errors.FEE_TOO_LARGE());
+        require(factory.isPairV3(poolAddress), Errors.NOT_POOL(poolAddress));
+        IRamsesV3Pool pool = IRamsesV3Pool(poolAddress);
+        gauge = voter.createCLGauge(pool.token0(), pool.token1(), pool.tickSpacing());
+        factory.setPoolFeeProtocol(poolAddress, initialFeeProtocol);
+    }
 
     function acceptFactoryOwnership(IVoter voter) external {
         Ownable2Step(_factory(voter)).acceptOwnership();

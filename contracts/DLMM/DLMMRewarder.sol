@@ -16,7 +16,7 @@ import {Uint256x256Math} from "./libraries/math/Uint256x256Math.sol";
 
 interface IDLMMVoterAntiJit {
     function isAntiSybilEnabled() external view returns (bool);
-    function timeThresholdForRewarder() external view returns (uint256);
+    function timeThresholdForGauge(address gauge) external view returns (uint256);
     function isAuthorizedDLMMManager(address manager) external view returns (bool);
 }
 
@@ -218,7 +218,7 @@ contract DLMMRewarder is DLMMBaseHooks, Initializable, OwnableUpgradeable {
         uint32 lastModified = bins[id].userLastModified[user];
         if (lastModified == 0) return false;
 
-        return block.timestamp - lastModified <= voter.timeThresholdForRewarder();
+        return block.timestamp - lastModified <= voter.timeThresholdForGauge(address(this));
     }
 
     function _releaseRewards(uint256 rewards) internal {

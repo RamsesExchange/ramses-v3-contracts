@@ -42,6 +42,8 @@ interface IVoter {
     event AuthorizedDLMMManagerAdded(address indexed manager);
     event AuthorizedDLMMManagerRemoved(address indexed manager);
 
+    event TimeThresholdForGaugeSet(address indexed gauge, uint256 timeThreshold);
+
     struct InitializationParams {
         address ram;
         address legacyFactory;
@@ -68,6 +70,10 @@ interface IVoter {
 
     /// @notice minimum time threshold for rewarder (in seconds)
     function timeThresholdForRewarder() external view returns (uint256);
+
+    /// @notice a gauge's anti-sybil time threshold (in seconds), falling back to timeThresholdForRewarder if unset
+    /// @param gauge CL gauge or DLMM rewarder
+    function timeThresholdForGauge(address gauge) external view returns (uint256);
 
     /// @notice reward validator contract for anti-sybil validation
     function rewardValidator() external view returns (address);
@@ -410,6 +416,10 @@ interface IVoter {
 
     /// @notice sets the minimum time threshold for rewarder (in seconds)
     function setTimeThresholdForRewarder(uint256 _timeThreshold) external;
+
+    /// @notice sets a gauge's anti-sybil time threshold (in seconds), 0 = use timeThresholdForRewarder
+    /// @param _gauge CL gauge or DLMM rewarder
+    function setTimeThresholdForGauge(address _gauge, uint256 _timeThreshold) external;
 
     /// @notice returns all voters for a period
     function getAllVotersPerPeriod(uint256 period) external view returns (address[] memory);

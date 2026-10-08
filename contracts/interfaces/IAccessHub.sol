@@ -119,6 +119,9 @@ interface IAccessHub {
     /// @notice sets the minimum time threshold for rewarder (in seconds)
     function setTimeThresholdForRewarder(uint256 _timeThreshold) external;
 
+    /// @notice sets a gauge's anti-sybil time threshold (in seconds), 0 = use timeThresholdForRewarder
+    function setTimeThresholdForGauge(address _gauge, uint256 _timeThreshold) external;
+
     /// @notice creates a new gauge for a legacy pool
     function createLegacyGauge(address _pool) external returns (address);
 

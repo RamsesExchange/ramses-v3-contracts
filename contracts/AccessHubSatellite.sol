@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import {IAccessHub} from "./interfaces/IAccessHub.sol";
+import {IAccessHubSatellite} from "./interfaces/IAccessHubSatellite.sol";
 import {
     AccessControlEnumerableUpgradeable
 } from "@openzeppelin/contracts-upgradeable/access/extensions/AccessControlEnumerableUpgradeable.sol";
@@ -42,8 +43,8 @@ interface IPharaohAutoVault {
 }
 
 /// @notice Shared AccessHub implementation for satellite deployments.
-/// @dev Retains the deployed Pharaoh storage layout and callable surface for upgrade compatibility.
-contract AccessHubSatellite is IAccessHub, Initializable, AccessControlEnumerableUpgradeable {
+/// @dev Retains the deployed Pharaoh storage layout. Legacy CL creation selectors intentionally revert.
+contract AccessHubSatellite is IAccessHubSatellite, Initializable, AccessControlEnumerableUpgradeable {
     /**
      * Start of Storage Slots
      */
@@ -315,40 +316,35 @@ contract AccessHubSatellite is IAccessHub, Initializable, AccessControlEnumerabl
         voter.setTimeThresholdForRewarder(_timeThreshold);
     }
 
+    /// @notice Set a gauge's time threshold (in seconds), overriding timeThresholdForRewarder
+    /// @param _gauge CL gauge or DLMM rewarder
+    /// @param _timeThreshold New time threshold in seconds (0 = use timeThresholdForRewarder)
+    function setTimeThresholdForGauge(address _gauge, uint256 _timeThreshold) external onlyRole(PROTOCOL_OPERATOR) {
+        voter.setTimeThresholdForGauge(_gauge, _timeThreshold);
+    }
+
     /// @inheritdoc IAccessHub
     function createLegacyGauge(address _pool) external onlyRole(PROTOCOL_OPERATOR) returns (address) {
         return voter.createGauge(_pool);
     }
 
-    function createCLGauge(address tokenA, address tokenB, int24 tickSpacing)
-        external
-        onlyRole(PROTOCOL_OPERATOR)
-        returns (address)
-    {
-        return _createCLGauge(tokenA, tokenB, tickSpacing, false);
+    /// @notice Deprecated: callers must supply a pool and its initial protocol-fee share.
+    function createCLGauge(address, address, int24) external pure returns (address) {
+        revert InitialFeeProtocolRequired();
     }
 
     /// @inheritdoc IAccessHub
-    function createCLGauge(address tokenA, address tokenB, int24 tickSpacing, bool forceVoterFees)
-        external
-        onlyRole(PROTOCOL_OPERATOR)
-        returns (address)
-    {
-        return _createCLGauge(tokenA, tokenB, tickSpacing, forceVoterFees);
+    function createCLGauge(address, address, int24, bool) external pure returns (address) {
+        revert InitialFeeProtocolRequired();
     }
 
-    function _createCLGauge(address tokenA, address tokenB, int24 tickSpacing, bool forceVoterFees)
-        internal
-        returns (address)
+    /// @inheritdoc IAccessHubSatellite
+    function createCLGauge(address _pool, uint24 _initialFeeProtocol)
+        external
+        onlyRole(PROTOCOL_OPERATOR)
+        returns (address gauge)
     {
-        address gauge = voter.createCLGauge(tokenA, tokenB, tickSpacing);
-
-        if (forceVoterFees) {
-            address pool = voter.poolForGauge(gauge);
-            ramsesV3PoolFactory.setPoolFeeProtocol(pool, 1_000_000);
-        }
-
-        return gauge;
+        return AccessHubExtension.createCLGauge(voter, ramsesV3PoolFactory, _pool, _initialFeeProtocol);
     }
 
     /// @inheritdoc IAccessHub
